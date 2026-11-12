@@ -141,6 +141,25 @@ public sealed class PlannerTests
     }
 
     [Fact]
+    public void Plan_ExistingTagOnDependency_StillResumesDependent()
+    {
+        // Given: A only has a manual tag at HEAD and breaking history; B (depends on A) was tagged 1.0.1 by an
+        // interrupted run. Planned without its tag, A looks like a major first release, which pushes B to 1.1.0.
+        var states = new[]
+        {
+            State("B", "1.0.0", ["fix: b"], "A") with { TaggedAtHead = new SemVersion(1, 0, 1) },
+            State("A", null, ["feat!: a"]) with { TaggedAtHead = new SemVersion(1, 0, 0) }
+        };
+
+        // When
+        var plan = Planner.Plan(states, Initial);
+
+        // Then: A settles as an existing release, and B's interrupted release is still finished
+        Assert.Equal([("B", "1.0.1", true)], plan.Releases.Select(p => (p.Id, p.NextVersion, p.Resumed)));
+        Assert.Equal("1.0.0", plan.Packages.Single(p => p.Id == "A").CurrentVersion);
+    }
+
+    [Fact]
     public void Plan_Cycle_Throws()
     {
         // Given

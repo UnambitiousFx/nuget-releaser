@@ -172,17 +172,7 @@ public sealed class ReleaserIntegrationTests : IDisposable
     public async Task ReleaseAsync_SecondGitHubReleaseFailsThenRerun_FinishesTheRelease()
     {
         // Given: an origin remote, a local folder feed, per-package GitHub Releases, and a GitHub that fails on the second one
-        var origin = Directory.CreateTempSubdirectory("nuget-releaser-origin-").FullName;
-        var feed = Directory.CreateTempSubdirectory("nuget-releaser-feed-").FullName;
-        _cleanup.AddRange([origin, feed]);
-        ProcessRunner.Run(origin, "git", "init", "-q", "--bare");
-        Git("remote", "add", "origin", origin);
-        Environment.SetEnvironmentVariable("NUGET_RELEASER_TESTS_KEY", "test");
-        var config = new ReleaserConfig
-        {
-            Github = new GitHubConfig { ReleaseMode = "per-package" },
-            Feed = [new FeedConfig { Name = "local", Source = feed, ApiKeyEnv = "NUGET_RELEASER_TESTS_KEY" }]
-        };
+        var (config, feed) = Publishing();
         var gitHub = new FakeGitHub(_root) { FailOn = "Lib.Http/v1.0.1" };
         File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
         // Committed but never pushed: the release itself must get HEAD to GitHub before creating a release on it.
@@ -226,6 +216,37 @@ public sealed class ReleaserIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task ReleaseAsync_ManualTagOnDependencyThenRerun_FinishesDependentRelease()
+    {
+        // Given: Lib.Core has a breaking change and a manual 1.5.0 tag at HEAD (the plan would say 2.0.0, so it is an
+        // existing release); Lib.Http, which depends on it, has its own fix
+        var (config, _) = Publishing();
+        var gitHub = new FakeGitHub(_root) { FailOn = "Lib.Http/v1.0.1" };
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("feat!: core rewrite");
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Http/B.cs"), "namespace Lib.Http { public class B { } }");
+        Commit("fix: http bug");
+        Git("tag", "Lib.Core/v1.5.0");
+        var output = Path.Combine(_root, "artifacts");
+
+        // When: the first run releases Lib.Http alone, then fails at its GitHub Release
+        var first = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        var firstPlan = first.Plan();
+        await Assert.ThrowsAsync<ReleaserException>(() => first.ReleaseAsync(firstPlan, output, dryRun: false));
+
+        // When: the release is run again
+        gitHub.FailOn = null;
+        var second = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        var plan = second.Plan();
+        await second.ReleaseAsync(plan, output, dryRun: false);
+
+        // Then: both runs plan the same release, and the re-run finishes it
+        Assert.Equal([("Lib.Http", "1.0.1")], firstPlan.Releases.Select(p => (p.Id, p.NextVersion)));
+        Assert.Equal([("Lib.Http", "1.0.1", true)], plan.Releases.Select(p => (p.Id, p.NextVersion, p.Resumed)));
+        Assert.Equal(["Lib.Http/v1.0.1"], gitHub.Releases);
+    }
+
+    [Fact]
     public void Plan_NewCommitAfterRelease_ReleasesNormally()
     {
         // Given: a release fully tagged at its commit, then a new change on top
@@ -241,6 +262,22 @@ public sealed class ReleaserIntegrationTests : IDisposable
 
         // Then: the earlier tags are ordinary tags again, nothing is resumed
         Assert.Equal([("Lib", "1.1.0", false)], plan.Releases.Select(p => (p.Id, p.NextVersion, p.Resumed)));
+    }
+
+    /// <summary>A bare <c>origin</c> remote, and a local folder feed with per-package GitHub Releases.</summary>
+    private (ReleaserConfig Config, string Feed) Publishing()
+    {
+        var origin = Directory.CreateTempSubdirectory("nuget-releaser-origin-").FullName;
+        var feed = Directory.CreateTempSubdirectory("nuget-releaser-feed-").FullName;
+        _cleanup.AddRange([origin, feed]);
+        ProcessRunner.Run(origin, "git", "init", "-q", "--bare");
+        Git("remote", "add", "origin", origin);
+        Environment.SetEnvironmentVariable("NUGET_RELEASER_TESTS_KEY", "test");
+        return (new ReleaserConfig
+        {
+            Github = new GitHubConfig { ReleaseMode = "per-package" },
+            Feed = [new FeedConfig { Name = "local", Source = feed, ApiKeyEnv = "NUGET_RELEASER_TESTS_KEY" }]
+        }, feed);
     }
 
     /// <summary>The GitHub Releases REST endpoints used by <see cref="GitHubReleases" />, in memory.</summary>

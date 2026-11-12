@@ -40,26 +40,27 @@ internal static class Planner
     ///     A tag at HEAD is resumed only when planning without it gives back exactly its version: that is the release a
     ///     previous run started. Otherwise it is an existing release (a manual tag, another tool's): the package is
     ///     replanned from that tag, which can change the cascade, until no tag at HEAD is left in doubt.
+    ///     One tag is settled per pass, the first mismatch in dependency order: its dependencies are settled, so its
+    ///     mismatch is real, whereas a dependent's may only come from a dependency's provisional plan.
     /// </summary>
     public static ReleasePlan Plan(IReadOnlyList<PackageState> states, SemVersion initialVersion)
     {
+        var byId = states.ToDictionary(s => s.Package.Id);
         while (true)
         {
-            var plan = PlanOnce(states, initialVersion);
-            var byId = plan.Packages.ToDictionary(p => p.Id);
-            var existing = states
-                .Where(s => s.TaggedAtHead is { } tagged && (!byId[s.Package.Id].Release || byId[s.Package.Id].NextVersion != tagged.ToString()))
-                .Select(s => s.Package.Id)
-                .ToHashSet();
-            if (existing.Count == 0)
+            var plan = PlanOnce([.. byId.Values], initialVersion);
+            var existing = plan.Packages.FirstOrDefault(p =>
+                byId[p.Id].TaggedAtHead is { } tagged && (!p.Release || p.NextVersion != tagged.ToString()));
+            if (existing is null)
             {
-                return new ReleasePlan([.. plan.Packages.Select(p => states.Single(s => s.Package.Id == p.Id).TaggedAtHead is null
+                return new ReleasePlan([.. plan.Packages.Select(p => byId[p.Id].TaggedAtHead is null
                     ? p
                     : p with { Resumed = true, Reasons = ["tagged at HEAD by a previous run: finishing its release", .. p.Reasons] })]);
             }
 
             // Tagged at HEAD: no commit since.
-            states = [.. states.Select(s => existing.Contains(s.Package.Id) ? s with { Current = s.TaggedAtHead, Commits = [], TaggedAtHead = null } : s)];
+            var state = byId[existing.Id];
+            byId[existing.Id] = state with { Current = state.TaggedAtHead, Commits = [], TaggedAtHead = null };
         }
     }
 
