@@ -1,7 +1,7 @@
 name: Binaries
 
 # Native AOT binaries for every supported platform, uploaded as nuget-releaser-<version>-<rid> artifacts.
-# Called by CI (validation) and by Release (assets of the GitHub release).
+# Called only by Release (assets of the GitHub release): pull requests do not build them.
 on:
   workflow_call:
     inputs:

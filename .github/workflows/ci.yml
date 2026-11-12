@@ -68,7 +68,3 @@ jobs:
           report_type: test_results
           files: ./test-results/junit/*.xml
           token: ${{ secrets.CODECOV_TOKEN }}
-
-  binaries:
-    name: Binaries
-    uses: ./.github/workflows/binaries.yml

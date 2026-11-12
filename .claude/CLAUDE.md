@@ -23,7 +23,8 @@ independently. Namespace: `UnambitiousFx.NugetReleaser`. Solution: `NugetRelease
   `JsonSerializerContext`s; never reflection-based overloads.
 - **Secrets**: never print or log a command line that may hold an API key.
 - **Distribution**: Native AOT binaries only (`linux`/`osx`/`win` × `x64`/`arm64`, `binaries.yml`), attached to the
-  GitHub release; the tool itself is not published to NuGet yet. Anything that breaks AOT breaks the release.
+  GitHub release; the tool itself is not published to NuGet yet. Binaries are built only on release, not on PRs:
+  anything that breaks AOT is caught only then, so check with `dotnet publish src/NugetReleaser -r <rid> -p:PublishAot=true`.
 - **Modern C#**: file-scoped namespaces, pattern matching, records, collection expressions.
 
 ## Conventions
