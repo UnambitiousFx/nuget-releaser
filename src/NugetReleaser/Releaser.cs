@@ -3,8 +3,15 @@ using System.Text;
 
 namespace UnambitiousFx.NugetReleaser;
 
-/// <summary>Executes a <see cref="ReleasePlan" />: pack, push, tag, GitHub Release. Each step skips what already exists.</summary>
-internal sealed class Releaser(Repository repository, ReleaserConfig config, TextWriter log)
+/// <summary>
+///     Executes a <see cref="ReleasePlan" />: pack, push, GitHub Release, tags. Each step skips what already exists, and
+///     tags come last: until they exist the plan is unchanged, so re-running after any failure resumes the release.
+/// </summary>
+/// <param name="repository">The git work tree to release from.</param>
+/// <param name="config">The loaded <c>nuget-releaser.toml</c>.</param>
+/// <param name="log">Where progress is written.</param>
+/// <param name="gitHub">Where GitHub Releases are created; <c>null</c> skips them.</param>
+internal sealed class Releaser(Repository repository, ReleaserConfig config, TextWriter log, GitHubReleases? gitHub)
 {
     /// <summary>Builds the plan from the repository's packages, tags and history.</summary>
     public ReleasePlan Plan()
@@ -27,6 +34,15 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
         {
             log.WriteLine("Nothing to release.");
             return;
+        }
+
+        // dotnet pack runs from the repository root: a relative path must not resolve twice, differently.
+        outputDirectory = Path.GetFullPath(outputDirectory);
+        var head = repository.Head;
+        if (!dryRun && repository.UncommittedChanges(outputDirectory) is { Count: > 0 } changes)
+        {
+            // The tags point at HEAD: what is packed must be exactly HEAD.
+            throw new ReleaserException($"Commit or stash these changes before releasing:\n  {string.Join("\n  ", changes)}");
         }
 
         var apiKeys = dryRun ? [] : config.Feed.ToDictionary(f => f.Name, ApiKey);
@@ -65,39 +81,31 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
             }
         }
 
-        var tags = new List<string>();
-        foreach (var release in releases)
-        {
-            var tag = TagFormat.Format(config.Defaults.TagFormat, release.Id, release.NextVersion);
-            if (!repository.TagExists(tag))
-            {
-                repository.CreateTag(tag, $"{release.Id} {release.NextVersion}");
-            }
+        var tags = releases.Select(r => TagFormat.Format(config.Defaults.TagFormat, r.Id, r.NextVersion)).ToList();
+        await CreateGitHubReleasesAsync(releases, tags, head);
 
-            tags.Add(tag);
-        }
-
+        // In per-package mode GitHub already created these tags on HEAD: pushing the same commit is a no-op.
         log.WriteLine($"Pushing tags {string.Join(", ", tags)}");
-        repository.PushTags(tags);
-
-        await CreateGitHubReleasesAsync(releases, tags);
+        repository.PushTags(tags, head);
+        foreach (var tag in tags.Where(t => !repository.TagExists(t)))
+        {
+            repository.CreateTag(tag, head);
+        }
     }
 
-    private async Task CreateGitHubReleasesAsync(List<PlannedPackage> releases, List<string> tags)
+    private async Task CreateGitHubReleasesAsync(List<PlannedPackage> releases, List<string> tags, string head)
     {
-        var github = GitHubReleases.FromEnvironment(repository.OriginUrl());
-        if (github is null)
+        if (gitHub is null)
         {
             log.WriteLine("No GITHUB_TOKEN or GitHub repository found: skipping GitHub Releases.");
             return;
         }
 
-        var head = repository.Head;
         if (config.Github.ReleaseMode == "per-package")
         {
             for (var i = 0; i < releases.Count; i++)
             {
-                await CreateAsync(github, tags[i], head, $"{releases[i].Id} {releases[i].NextVersion}", Notes(releases[i]));
+                await CreateAsync(gitHub, tags[i], head, $"{releases[i].Id} {releases[i].NextVersion}", Notes(releases[i]));
             }
 
             return;
@@ -105,7 +113,7 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
 
         var name = string.Join(", ", releases.Select(r => $"{r.Id} {r.NextVersion}"));
         var body = string.Join("\n\n", releases.Select(r => $"## {r.Id} {r.NextVersion}\n\n{Notes(r)}"));
-        await CreateAsync(github, $"releases/{head[..7]}", head, name, body);
+        await CreateAsync(gitHub, $"releases/{head[..7]}", head, name, body);
     }
 
     private async Task CreateAsync(GitHubReleases github, string tag, string target, string name, string body)

@@ -50,7 +50,7 @@ try
     var config = ReleaserConfig.Load(options.GetValueOrDefault("--config") ?? Path.Combine(repository.Root, ReleaserConfig.FileName));
     var json = options.ContainsKey("--json");
     // With --json, stdout carries only the plan so it can be piped.
-    var releaser = new Releaser(repository, config, json ? Console.Error : Console.Out);
+    var releaser = new Releaser(repository, config, json ? Console.Error : Console.Out, GitHubReleases.FromEnvironment(repository.OriginUrl()));
     var plan = releaser.Plan();
 
     if (json)

@@ -63,8 +63,20 @@ internal sealed class Repository
         }).ToList();
     }
 
+    /// <summary>Tags reachable from HEAD: a tag cut on another branch says nothing about this history's versions.</summary>
     public IReadOnlyList<string> Tags() =>
-        Git(Root, "tag", "--list").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        Git(Root, "tag", "--list", "--merged", "HEAD").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    /// <summary>Tracked or untracked (not ignored) changes outside <paramref name="excludedDirectory" />.</summary>
+    public IReadOnlyList<string> UncommittedChanges(string excludedDirectory)
+    {
+        var excluded = Relative(Path.GetFullPath(excludedDirectory)) + "/";
+        return Git(Root, "status", "--porcelain", "--untracked-files=all")
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line[3..].Trim('"'))
+            .Where(path => !path.StartsWith(excluded, StringComparison.Ordinal))
+            .ToList();
+    }
 
     /// <summary>Commits reachable from HEAD but not from <paramref name="since" /> that touch one of <paramref name="paths" />.</summary>
     public IReadOnlyList<Commit> CommitsSince(string? since, IEnumerable<string> paths) =>
@@ -77,11 +89,15 @@ internal sealed class Repository
     public bool TagExists(string tag) =>
         Git(Root, "tag", "--list", tag).Trim().Length > 0;
 
-    public void CreateTag(string tag, string message) =>
-        Git(Root, "tag", "-a", tag, "-m", message);
+    /// <summary>
+    ///     Lightweight tags, so pushing a tag GitHub already created for a release at the same commit is a no-op
+    ///     and an interrupted release can be re-run.
+    /// </summary>
+    public void CreateTag(string tag, string commit) =>
+        Git(Root, "tag", tag, commit);
 
-    public void PushTags(IEnumerable<string> tags) =>
-        Git(Root, ["push", "origin", .. tags.Select(t => $"refs/tags/{t}")]);
+    public void PushTags(IEnumerable<string> tags, string commit) =>
+        Git(Root, ["push", "origin", .. tags.Select(t => $"{commit}:refs/tags/{t}")]);
 
     public string? OriginUrl()
     {
@@ -100,22 +116,43 @@ internal sealed class Repository
     private static string Git(string directory, params IEnumerable<string> arguments) =>
         ProcessRunner.Run(directory, "git", arguments);
 
+    /// <summary>
+    ///     Evaluated as <c>dotnet pack</c> sees it: Release, and once per target framework, since a
+    ///     <c>ProjectReference</c> conditioned on <c>$(TargetFramework)</c> is invisible to the outer build.
+    /// </summary>
     private EvaluatedProject Evaluate(string fullPath)
     {
-        var json = ProcessRunner.Run(Root, "dotnet", "msbuild", fullPath,
-            "-getProperty:IsPackable", "-getProperty:PackageId", "-getItem:ProjectReference");
-        using var document = JsonDocument.Parse(json);
+        using var document = MsBuild(fullPath, null, "-getProperty:IsPackable", "-getProperty:PackageId", "-getProperty:TargetFrameworks");
         var properties = document.RootElement.GetProperty("Properties");
-        var references = document.RootElement.TryGetProperty("Items", out var items) && items.TryGetProperty("ProjectReference", out var refs)
-            ? refs.EnumerateArray().Select(r => Path.GetFullPath(r.GetProperty("FullPath").GetString()!)).ToList()
-            : [];
+        var references = References(document);
+
+        var targetFrameworks = properties.GetProperty("TargetFrameworks").GetString()!
+            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        foreach (var targetFramework in targetFrameworks)
+        {
+            using var inner = MsBuild(fullPath, targetFramework);
+            references.UnionWith(References(inner));
+        }
 
         return new EvaluatedProject(
             fullPath,
             properties.GetProperty("PackageId").GetString()!,
             string.Equals(properties.GetProperty("IsPackable").GetString(), "true", StringComparison.OrdinalIgnoreCase),
-            references);
+            [.. references.Order(StringComparer.Ordinal)]);
     }
+
+    private JsonDocument MsBuild(string fullPath, string? targetFramework, params string[] properties) =>
+        JsonDocument.Parse(ProcessRunner.Run(Root, "dotnet",
+        [
+            "msbuild", fullPath, "-p:Configuration=Release",
+            .. targetFramework is null ? Array.Empty<string>() : [$"-p:TargetFramework={targetFramework}"],
+            .. properties, "-getItem:ProjectReference"
+        ]));
+
+    private static HashSet<string> References(JsonDocument document) =>
+        document.RootElement.TryGetProperty("Items", out var items) && items.TryGetProperty("ProjectReference", out var refs)
+            ? refs.EnumerateArray().Select(r => Path.GetFullPath(r.GetProperty("FullPath").GetString()!)).ToHashSet(StringComparer.Ordinal)
+            : new HashSet<string>(StringComparer.Ordinal);
 
     private sealed record EvaluatedProject(string FullPath, string PackageId, bool IsPackable, List<string> References);
 }

@@ -92,7 +92,8 @@ jobs:
           if [[ "${{ matrix.rid }}" == win-* ]]; then
             (cd staging && 7z a "../dist/$name.zip" .)
           else
-            tar -czf "dist/$name.tar.gz" -C staging .
+            # Entries named without a leading ./, so `tar -xzf <archive> nuget-releaser` works with GNU tar.
+            (cd staging && tar -czf "../dist/$name.tar.gz" *)
           fi
 
       - name: Upload
