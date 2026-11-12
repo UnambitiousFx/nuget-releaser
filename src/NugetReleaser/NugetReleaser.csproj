@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>$(LatestTargetFramework)</TargetFramework>
+        <PackageId>UnambitiousFx.NugetReleaser</PackageId>
+        <PackAsTool>true</PackAsTool>
+        <ToolCommandName>nuget-releaser</ToolCommandName>
+        <!-- A global tool keeps working when the machine only has a newer runtime. -->
+        <RollForward>Major</RollForward>
+        <InvariantGlobalization>true</InvariantGlobalization>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Tomlyn" />
+    </ItemGroup>
+</Project>

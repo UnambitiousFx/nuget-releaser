@@ -1,0 +1,103 @@
+name: Release
+
+# Every successful CI run of a push to main releases the version computed from conventional commits
+# (feat → minor, fix/perf → patch, `!`/BREAKING CHANGE → major, anything else → no release).
+# For now the tool ships only as Native AOT binaries attached to the GitHub release; nothing is pushed to NuGet.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  SEMANTIC_RELEASE_VERSION: '25'
+  SEMANTIC_RELEASE_PLUGINS: conventional-changelog-conventionalcommits@9
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  version:
+    name: Compute next version
+    # No release while the repository is private: binaries would publish code nobody can see yet.
+    if: ${{ !github.event.repository.private && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')) }}
+    runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.next.outputs.new_release_published }}
+      version: ${{ steps.next.outputs.new_release_version }}
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          # The commit CI validated, not whatever main points to now.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      # semantic-release needs a local main branch; if main moved on since, it skips and the newer run releases.
+      - name: Point main at the validated commit
+        id: sha
+        run: |
+          git switch -C main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Dry run first: the tag and GitHub release are only created once every binary is built,
+      # so a failed build can simply be re-run.
+      - name: Compute next version
+        id: next
+        uses: cycjimmy/semantic-release-action@v8
+        with:
+          dry_run: true
+          semantic_version: ${{ env.SEMANTIC_RELEASE_VERSION }}
+          extra_plugins: ${{ env.SEMANTIC_RELEASE_PLUGINS }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  binaries:
+    name: Binaries
+    needs: version
+    if: needs.version.outputs.published == 'true'
+    uses: ./.github/workflows/binaries.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      ref: ${{ needs.version.outputs.sha }}
+
+  release:
+    name: Create tag and GitHub release
+    needs: [version, binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Point main at the validated commit
+        run: git switch -C main
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: nuget-releaser-${{ needs.version.outputs.version }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum * > checksums.txt && cat checksums.txt
+
+      # Picks up every file in dist/ as a release asset (.releaserc.json).
+      - name: Create tag and GitHub release
+        uses: cycjimmy/semantic-release-action@v8
+        with:
+          semantic_version: ${{ env.SEMANTIC_RELEASE_VERSION }}
+          extra_plugins: ${{ env.SEMANTIC_RELEASE_PLUGINS }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

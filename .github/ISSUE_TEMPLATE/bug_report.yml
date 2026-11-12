@@ -1,0 +1,96 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the information below to help us diagnose the issue.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+      placeholder: Tell us what went wrong
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Steps to reproduce the behavior
+      placeholder: |
+        1. Configure nuget-releaser.toml with '...'
+        2. Run 'nuget-releaser plan'
+        3. Observe '...'
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: A clear and concise description of what you expected to happen.
+      placeholder: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened?
+      placeholder: What actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: code
+    attributes:
+      label: Configuration and output
+      description: Your nuget-releaser.toml and the command output (redact any secret)
+      render: toml
+      placeholder: |
+        [defaults]
+        tag_format = "{package}/v{version}"
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Library version
+      description: Which version of nuget-releaser are you using?
+      placeholder: e.g., 1.0.0
+    validations:
+      required: true
+
+  - type: input
+    id: dotnet-version
+    attributes:
+      label: .NET version
+      description: Which .NET version are you using?
+      placeholder: e.g., .NET 10.0
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Which operating system are you using?
+      placeholder: e.g., Windows 11, macOS 14, Ubuntu 22.04
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add any other context about the problem here.
+      placeholder: Any additional information that might be helpful
+    validations:
+      required: false
