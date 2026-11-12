@@ -1,0 +1,26 @@
+<Project>
+    <Import Project="$([MSBuild]::GetPathOfFileAbove(&#39;build.props&#39;))" />
+
+    <PropertyGroup>
+        <IsPackable>false</IsPackable>
+        <IsTestProject>true</IsTestProject>
+        <TargetFramework>$(LatestTargetFramework)</TargetFramework>
+    </PropertyGroup>
+
+    <!-- Microsoft Testing Platform (MTP v2) -->
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Using Include="Xunit" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="xunit.v3.mtp-v2" />
+        <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" />
+        <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" />
+        <PackageReference Include="JetBrains.Annotations" />
+    </ItemGroup>
+</Project>

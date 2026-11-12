@@ -1,0 +1,331 @@
+namespace UnambitiousFx.NugetReleaser.Tests;
+
+/// <summary>Runs against a real git repository and real <c>dotnet msbuild</c> / <c>dotnet pack</c>.</summary>
+public sealed class ReleaserIntegrationTests : IDisposable
+{
+    private readonly string _root;
+    private readonly List<string> _cleanup = [];
+
+    public ReleaserIntegrationTests()
+    {
+        var directory = Directory.CreateTempSubdirectory("nuget-releaser-").FullName;
+        ProcessRunner.Run(directory, "git", "init", "-q", "-b", "main");
+        // The path git reports (on macOS /var/... is a symlink to /private/var/...), as the tool sees it.
+        _root = Repository.Open(directory).Root;
+        Git("config", "user.email", "test@example.com");
+        Git("config", "user.name", "test");
+        Git("config", "tag.gpgSign", "false");
+        Git("config", "commit.gpgSign", "false");
+        File.WriteAllText(Path.Combine(_root, ".gitignore"), "bin/\nobj/\n");
+        Project("src/Lib/Lib.csproj", "");
+        // Lib.Core shares the "src/Lib" prefix: its changes must not be attributed to Lib.
+        Project("src/Lib.Core/Lib.Core.csproj", "");
+        Project("src/Lib.Http/Lib.Http.csproj", """<ItemGroup><ProjectReference Include="../Lib.Core/Lib.Core.csproj" /></ItemGroup>""");
+        Project("test/Lib.Tests/Lib.Tests.csproj", "<PropertyGroup><IsPackable>false</IsPackable></PropertyGroup>");
+        Commit("feat: initial");
+        Git("tag", "Lib/v1.0.0");
+        Git("tag", "Lib.Core/v1.0.0");
+        Git("tag", "Lib.Http/v1.0.0");
+    }
+
+    public void Dispose()
+    {
+        foreach (var directory in _cleanup.Prepend(_root))
+        {
+            // git writes its objects read-only, and Windows refuses to delete read-only files.
+            foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+            {
+                File.SetAttributes(file, FileAttributes.Normal);
+            }
+
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public void Plan_NothingChangedSinceTags_ReleasesNothing()
+    {
+        // Given
+        File.WriteAllText(Path.Combine(_root, "test/Lib.Tests/x.txt"), "x");
+        Commit("fix: test only");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then
+        Assert.Equal(3, plan.Packages.Count);
+        Assert.Empty(plan.Releases);
+    }
+
+    [Fact]
+    public void Plan_CoreFix_ReleasesCoreAndDependentOnly()
+    {
+        // Given
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then
+        var released = plan.Releases.ToDictionary(p => p.Id, p => p.NextVersion);
+        Assert.Equal(new Dictionary<string, string> { ["Lib.Core"] = "1.0.1", ["Lib.Http"] = "1.0.1" }, released);
+    }
+
+    [Fact]
+    public void Plan_SharedFileChange_ReleasesEveryPackage()
+    {
+        // Given
+        File.WriteAllText(Path.Combine(_root, "Directory.Build.props"), "<Project />");
+        Commit("fix: shared build setting");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then
+        Assert.Equal(3, plan.Releases.Count());
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_DryRun_PacksDependentsAgainstNewDependencyVersion()
+    {
+        // Given
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("feat!: new core");
+        var releaser = Releaser();
+        var output = Path.Combine(_root, "artifacts");
+
+        // When
+        await releaser.ReleaseAsync(releaser.Plan(), output, dryRun: true);
+
+        // Then: each package keeps its own version, and Lib.Http depends on the new Lib.Core
+        Assert.True(File.Exists(Path.Combine(output, "Lib.Core.2.0.0.nupkg")));
+        using var http = System.IO.Compression.ZipFile.OpenRead(Path.Combine(output, "Lib.Http.1.1.0.nupkg"));
+        using var nuspec = new StreamReader(http.GetEntry("Lib.Http.nuspec")!.Open());
+        Assert.Contains("""<dependency id="Lib.Core" version="2.0.0" """, await nuspec.ReadToEndAsync(TestContext.Current.CancellationToken));
+        Assert.Empty(Git("tag", "--list", "*2.0.0").Trim());
+    }
+
+    [Fact]
+    public void Plan_HigherTagOnAnotherBranch_IsIgnored()
+    {
+        // Given: Lib/v2.0.0 only exists on a branch that is not merged into main
+        Git("switch", "-q", "-c", "next");
+        File.WriteAllText(Path.Combine(_root, "src/Lib/Next.cs"), "namespace Lib { public class Next { } }");
+        Commit("feat!: next major");
+        Git("tag", "Lib/v2.0.0");
+        Git("switch", "-q", "main");
+        File.WriteAllText(Path.Combine(_root, "src/Lib/Fix.cs"), "namespace Lib { public class Fix { } }");
+        Commit("fix: maintenance fix");
+
+        // When
+        var lib = Releaser().Plan().Packages.Single(p => p.Id == "Lib");
+
+        // Then
+        Assert.Equal("1.0.0", lib.CurrentVersion);
+        Assert.Equal("1.0.1", lib.NextVersion);
+    }
+
+    [Fact]
+    public void Plan_ReferenceForOneTargetFrameworkOnly_CascadesRelease()
+    {
+        // Given: Lib.Multi references Lib.Core for net8.0 only, invisible to the outer (multi-targeting) evaluation
+        var multi = Path.Combine(_root, "src/Lib.Multi/Lib.Multi.csproj");
+        Directory.CreateDirectory(Path.GetDirectoryName(multi)!);
+        File.WriteAllText(multi, """
+                                 <Project Sdk="Microsoft.NET.Sdk">
+                                   <PropertyGroup><TargetFrameworks>netstandard2.0;net8.0</TargetFrameworks></PropertyGroup>
+                                   <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'"><ProjectReference Include="../Lib.Core/Lib.Core.csproj" /></ItemGroup>
+                                 </Project>
+                                 """);
+        Commit("feat: multi");
+        Git("tag", "Lib.Multi/v1.0.0");
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then
+        Assert.Contains(plan.Releases, p => p.Id == "Lib.Multi" && p.NextVersion == "1.0.1");
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_UncommittedChange_RefusesToPublish()
+    {
+        // Given: a committed fix, plus an edit that the plan does not know about
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class B { } }");
+        var releaser = Releaser();
+
+        // When
+        var error = await Assert.ThrowsAsync<ReleaserException>(() =>
+            releaser.ReleaseAsync(releaser.Plan(), Path.Combine(_root, "artifacts"), dryRun: false));
+
+        // Then
+        Assert.Contains("src/Lib.Core/A.cs", error.Message);
+        Assert.False(Directory.Exists(Path.Combine(_root, "artifacts")));
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_SecondGitHubReleaseFailsThenRerun_FinishesTheRelease()
+    {
+        // Given: an origin remote, a local folder feed, per-package GitHub Releases, and a GitHub that fails on the second one
+        var (config, feed) = Publishing();
+        var gitHub = new FakeGitHub(_root) { FailOn = "Lib.Http/v1.0.1" };
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        // Committed but never pushed: the release itself must get HEAD to GitHub before creating a release on it.
+        Commit("fix: core bug");
+        // inside the work tree on purpose: the output directory must not count as an uncommitted change
+        var output = Path.Combine(_root, "artifacts");
+
+        // When: the first run fails at the second GitHub Release
+        var first = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        await Assert.ThrowsAsync<ReleaserException>(() => first.ReleaseAsync(first.Plan(), output, dryRun: false));
+
+        // Then: packages and tags are published, one GitHub Release is missing
+        Assert.Contains("lib.http.1.0.1.nupkg", Directory.EnumerateFiles(feed, "*.nupkg", SearchOption.AllDirectories).Select(f => Path.GetFileName(f).ToLowerInvariant()));
+        Assert.Contains("refs/tags/Lib.Http/v1.0.1", ProcessRunner.Run(_root, "git", "ls-remote", "--tags", "origin"));
+        Assert.Equal(["Lib.Core/v1.0.1"], gitHub.Releases);
+
+        // When: the release is run again
+        gitHub.FailOn = null;
+        var second = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        var plan = second.Plan();
+        await second.ReleaseAsync(plan, output, dryRun: false);
+
+        // Then: the tagged packages are planned again with the same versions, and the missing release is created
+        Assert.Equal([("Lib.Core", "1.0.1", true), ("Lib.Http", "1.0.1", true)], plan.Releases.Select(p => (p.Id, p.NextVersion, p.Resumed)));
+        Assert.Equal(["Lib.Core/v1.0.1", "Lib.Http/v1.0.1"], gitHub.Releases);
+        // Each release was created once its commit and tag were on the remote.
+        Assert.All(gitHub.TagOnRemoteWhenCreated, Assert.True);
+    }
+
+    [Fact]
+    public void Plan_ExistingTagsAtHead_AreExistingReleases()
+    {
+        // Given: the fixture as is, every package tagged v1.0.0 on HEAD, as when adopting the tool on a tagged repository
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then
+        Assert.Empty(plan.Releases);
+        Assert.All(plan.Packages, p => Assert.Equal("1.0.0", p.CurrentVersion));
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_ManualTagOnDependencyThenRerun_FinishesDependentRelease()
+    {
+        // Given: Lib.Core has a breaking change and a manual 1.5.0 tag at HEAD (the plan would say 2.0.0, so it is an
+        // existing release); Lib.Http, which depends on it, has its own fix
+        var (config, _) = Publishing();
+        var gitHub = new FakeGitHub(_root) { FailOn = "Lib.Http/v1.0.1" };
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("feat!: core rewrite");
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Http/B.cs"), "namespace Lib.Http { public class B { } }");
+        Commit("fix: http bug");
+        Git("tag", "Lib.Core/v1.5.0");
+        var output = Path.Combine(_root, "artifacts");
+
+        // When: the first run releases Lib.Http alone, then fails at its GitHub Release
+        var first = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        var firstPlan = first.Plan();
+        await Assert.ThrowsAsync<ReleaserException>(() => first.ReleaseAsync(firstPlan, output, dryRun: false));
+
+        // When: the release is run again
+        gitHub.FailOn = null;
+        var second = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        var plan = second.Plan();
+        await second.ReleaseAsync(plan, output, dryRun: false);
+
+        // Then: both runs plan the same release, and the re-run finishes it
+        Assert.Equal([("Lib.Http", "1.0.1")], firstPlan.Releases.Select(p => (p.Id, p.NextVersion)));
+        Assert.Equal([("Lib.Http", "1.0.1", true)], plan.Releases.Select(p => (p.Id, p.NextVersion, p.Resumed)));
+        Assert.Equal(["Lib.Http/v1.0.1"], gitHub.Releases);
+    }
+
+    [Fact]
+    public void Plan_NewCommitAfterRelease_ReleasesNormally()
+    {
+        // Given: a release fully tagged at its commit, then a new change on top
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+        Git("tag", "Lib.Core/v1.0.1");
+        Git("tag", "Lib.Http/v1.0.1");
+        File.WriteAllText(Path.Combine(_root, "src/Lib/B.cs"), "namespace Lib { public class B { } }");
+        Commit("feat: lib feature");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then: the earlier tags are ordinary tags again, nothing is resumed
+        Assert.Equal([("Lib", "1.1.0", false)], plan.Releases.Select(p => (p.Id, p.NextVersion, p.Resumed)));
+    }
+
+    /// <summary>A bare <c>origin</c> remote, and a local folder feed with per-package GitHub Releases.</summary>
+    private (ReleaserConfig Config, string Feed) Publishing()
+    {
+        var origin = Directory.CreateTempSubdirectory("nuget-releaser-origin-").FullName;
+        var feed = Directory.CreateTempSubdirectory("nuget-releaser-feed-").FullName;
+        _cleanup.AddRange([origin, feed]);
+        ProcessRunner.Run(origin, "git", "init", "-q", "--bare");
+        Git("remote", "add", "origin", origin);
+        Environment.SetEnvironmentVariable("NUGET_RELEASER_TESTS_KEY", "test");
+        return (new ReleaserConfig
+        {
+            Github = new GitHubConfig { ReleaseMode = "per-package" },
+            Feed = [new FeedConfig { Name = "local", Source = feed, ApiKeyEnv = "NUGET_RELEASER_TESTS_KEY" }]
+        }, feed);
+    }
+
+    /// <summary>The GitHub Releases REST endpoints used by <see cref="GitHubReleases" />, in memory.</summary>
+    private sealed class FakeGitHub(string repository) : HttpMessageHandler
+    {
+        public List<string> Releases { get; } = [];
+        public List<bool> TagOnRemoteWhenCreated { get; } = [];
+        public string? FailOn { get; set; }
+
+        public GitHubReleases Client() => new(new HttpClient(this, disposeHandler: false) { BaseAddress = new Uri("https://api.github.test/") }, "o/r");
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            const string byTag = "/releases/tags/";
+            var path = request.RequestUri!.AbsolutePath;
+            if (request.Method == HttpMethod.Get)
+            {
+                var tag = Uri.UnescapeDataString(path[(path.IndexOf(byTag, StringComparison.Ordinal) + byTag.Length)..]);
+                return new HttpResponseMessage(Releases.Contains(tag) ? System.Net.HttpStatusCode.OK : System.Net.HttpStatusCode.NotFound);
+            }
+
+            using var body = System.Text.Json.JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
+            var created = body.RootElement.GetProperty("tag_name").GetString()!;
+            if (created == FailOn)
+            {
+                return new HttpResponseMessage(System.Net.HttpStatusCode.InternalServerError);
+            }
+
+            TagOnRemoteWhenCreated.Add(ProcessRunner.Run(repository, "git", "ls-remote", "--tags", "origin").Contains($"refs/tags/{created}"));
+            Releases.Add(created);
+            return new HttpResponseMessage(System.Net.HttpStatusCode.Created);
+        }
+    }
+
+    private Releaser Releaser() => new(Repository.Open(_root), new ReleaserConfig(), TextWriter.Null, null);
+
+    private void Project(string path, string content)
+    {
+        var fullPath = Path.Combine(_root, path);
+        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+        File.WriteAllText(fullPath, $"""<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>netstandard2.0</TargetFramework></PropertyGroup>{content}</Project>""");
+    }
+
+    private void Commit(string message)
+    {
+        Git("add", "-A");
+        Git("commit", "-q", "-m", message);
+    }
+
+    private string Git(params string[] arguments) => ProcessRunner.Run(_root, "git", arguments);
+}

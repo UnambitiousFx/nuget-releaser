@@ -1,0 +1,104 @@
+name: Binaries
+
+# Native AOT binaries for every supported platform, uploaded as nuget-releaser-<version>-<rid> artifacts.
+# Called only by Release (assets of the GitHub release): pull requests do not build them.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version stamped in the binaries and their archive names
+        type: string
+        default: 0.0.0-dev
+      ref:
+        description: Commit to build (default the commit that triggered the caller)
+        type: string
+        default: ''
+
+env:
+  DOTNET_VERSION: "11.0.x"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  binary:
+    name: ${{ matrix.rid }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Native AOT cannot cross-compile to another OS; each OS builds on its own runner.
+      matrix:
+        include:
+          - { rid: linux-x64,   os: ubuntu-latest,    smoke: true }
+          - { rid: linux-arm64, os: ubuntu-24.04-arm, smoke: true }
+          - { rid: osx-arm64,   os: macos-latest,     smoke: true }
+          # Cross-architecture build on the Apple silicon runner (Xcode ships both toolchains); cannot run there.
+          - { rid: osx-x64,     os: macos-latest,     smoke: false }
+          - { rid: win-x64,     os: windows-latest,   smoke: true }
+          - { rid: win-arm64,   os: windows-11-arm,   smoke: true }
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          # The smoke test walks the git history.
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # CI=true turns on GeneratePackageOnBuild (src/Directory.Build.props), which a Native AOT publish rejects.
+      - name: Publish Native AOT
+        run: >
+          dotnet publish src/NugetReleaser/NugetReleaser.csproj
+          --configuration Release
+          --runtime ${{ matrix.rid }}
+          -p:PublishAot=true
+          -p:Version=${{ inputs.version }}
+          -p:GeneratePackageOnBuild=false
+          --output ./publish
+
+      - name: Stage
+        run: |
+          ext=""
+          if [[ "${{ matrix.rid }}" == win-* ]]; then ext=".exe"; fi
+          mkdir staging
+          cp "publish/UnambitiousFx.NugetReleaser$ext" "staging/nuget-releaser$ext"
+          cp LICENSE README.md staging/
+          echo "BINARY=staging/nuget-releaser$ext" >> "$GITHUB_ENV"
+
+      # Reads the config, evaluates the projects and walks git history: the plan must list the tool itself.
+      - name: Smoke test
+        if: matrix.smoke
+        run: |
+          plan=$("$BINARY" plan --json)
+          echo "$plan"
+          if ! grep -qF '"id": "UnambitiousFx.NugetReleaser"' <<< "$plan"; then
+            echo "✗ The ${{ matrix.rid }} binary did not plan UnambitiousFx.NugetReleaser"
+            exit 1
+          fi
+          echo "✓ Configuration, discovery and planning work under Native AOT on ${{ matrix.rid }}"
+
+      - name: Archive
+        run: |
+          name="nuget-releaser-${{ inputs.version }}-${{ matrix.rid }}"
+          mkdir dist
+          if [[ "${{ matrix.rid }}" == win-* ]]; then
+            (cd staging && 7z a "../dist/$name.zip" .)
+          else
+            # Entries named without a leading ./, so `tar -xzf <archive> nuget-releaser` works with GNU tar.
+            (cd staging && tar -czf "../dist/$name.tar.gz" *)
+          fi
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuget-releaser-${{ inputs.version }}-${{ matrix.rid }}
+          path: dist/*
+          if-no-files-found: error
