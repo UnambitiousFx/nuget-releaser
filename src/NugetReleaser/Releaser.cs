@@ -4,8 +4,9 @@ using System.Text;
 namespace UnambitiousFx.NugetReleaser;
 
 /// <summary>
-///     Executes a <see cref="ReleasePlan" />: pack, push, GitHub Release, tags. Each step skips what already exists, and
-///     tags come last: until they exist the plan is unchanged, so re-running after any failure resumes the release.
+///     Executes a <see cref="ReleasePlan" />: pack, push, tags, GitHub Release. Each step skips what already exists. A
+///     package whose tag already points at HEAD is planned again as if untagged, so re-running after any failure
+///     finishes the release that run started.
 /// </summary>
 /// <param name="repository">The git work tree to release from.</param>
 /// <param name="config">The loaded <c>nuget-releaser.toml</c>.</param>
@@ -16,11 +17,13 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
     /// <summary>Builds the plan from the repository's packages, tags and history.</summary>
     public ReleasePlan Plan()
     {
-        var tags = repository.Tags();
+        var tagsAtHead = repository.TagsAtHead().ToHashSet(StringComparer.Ordinal);
+        var tags = repository.Tags().Where(t => !tagsAtHead.Contains(t)).ToList();
         var states = repository.DiscoverPackages(config).Select(package =>
         {
             var latest = TagFormat.Latest(config.Defaults.TagFormat, package.Id, tags);
-            return new PackageState(package, latest?.Version, repository.CommitsSince(latest?.Tag, package.Paths));
+            var tagged = TagFormat.Latest(config.Defaults.TagFormat, package.Id, tagsAtHead);
+            return new PackageState(package, latest?.Version, repository.CommitsSince(latest?.Tag, package.Paths), tagged?.Version);
         }).ToList();
 
         return Planner.Plan(states, SemVersion.Parse(config.Defaults.InitialVersion));
@@ -81,16 +84,16 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
             }
         }
 
+        // All tags or none, and before the GitHub Release: the push also uploads HEAD, which GitHub needs to create it.
         var tags = releases.Select(r => TagFormat.Format(config.Defaults.TagFormat, r.Id, r.NextVersion)).ToList();
-        await CreateGitHubReleasesAsync(releases, tags, head);
-
-        // In per-package mode GitHub already created these tags on HEAD: pushing the same commit is a no-op.
         log.WriteLine($"Pushing tags {string.Join(", ", tags)}");
         repository.PushTags(tags, head);
         foreach (var tag in tags.Where(t => !repository.TagExists(t)))
         {
             repository.CreateTag(tag, head);
         }
+
+        await CreateGitHubReleasesAsync(releases, tags, head);
     }
 
     private async Task CreateGitHubReleasesAsync(List<PlannedPackage> releases, List<string> tags, string head)

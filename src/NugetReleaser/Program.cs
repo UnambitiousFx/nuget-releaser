@@ -84,7 +84,7 @@ static void PrintPlan(ReleasePlan plan)
     foreach (var package in plan.Packages)
     {
         var versions = package.Release
-            ? $"{package.CurrentVersion ?? "-"} → {package.NextVersion}"
+            ? $"{package.CurrentVersion ?? "-"} → {package.NextVersion}{(package.Resumed ? " (resuming)" : "")}"
             : $"{package.CurrentVersion} (unchanged)";
         Console.WriteLine($"  {package.Id.PadRight(width)}  {versions}");
         foreach (var reason in package.Reasons)

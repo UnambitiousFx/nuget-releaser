@@ -5,10 +5,17 @@ namespace UnambitiousFx.NugetReleaser;
 /// <summary>A packable project, with the package ids it references through <c>ProjectReference</c>.</summary>
 internal sealed record PackageInfo(string Id, string Project, IReadOnlyList<string> Dependencies, IReadOnlyList<string> Paths);
 
-/// <summary>A package with its last released version (<c>null</c> if never released) and the commits since.</summary>
-internal sealed record PackageState(PackageInfo Package, SemVersion? Current, IReadOnlyList<Commit> Commits);
+/// <summary>
+///     A package with its last released version (<c>null</c> if never released) and the commits since.
+///     <see cref="TaggedAtHead" /> is the version a previous run of this commit already tagged, left out of
+///     <see cref="Current" /> so the plan finishes that release instead of skipping it.
+/// </summary>
+internal sealed record PackageState(PackageInfo Package, SemVersion? Current, IReadOnlyList<Commit> Commits, SemVersion? TaggedAtHead = null);
 
-/// <summary>What the run does with one package. <see cref="NextVersion" /> equals the current one when it is not released.</summary>
+/// <summary>
+///     What the run does with one package. <see cref="NextVersion" /> equals the current one when it is not released.
+///     <see cref="Resumed" />: already tagged at HEAD by a previous run, which this run finishes.
+/// </summary>
 internal sealed record PlannedPackage(
     string Id,
     string Project,
@@ -17,7 +24,8 @@ internal sealed record PlannedPackage(
     Bump Bump,
     bool Release,
     IReadOnlyList<string> Reasons,
-    IReadOnlyList<Commit> Commits);
+    IReadOnlyList<Commit> Commits,
+    bool Resumed = false);
 
 /// <summary>The single source of truth of a run: every package in dependency order.</summary>
 internal sealed record ReleasePlan(IReadOnlyList<PlannedPackage> Packages)
@@ -65,6 +73,17 @@ internal static class Planner
                 var release = bump != Bump.None;
                 result = new PlannedPackage(state.Package.Id, state.Package.Project, current.ToString(),
                     current.Increment(bump).ToString(), bump, release, release ? reasons : [], state.Commits);
+            }
+
+            if (state.TaggedAtHead is { } tagged)
+            {
+                if (!result.Release || result.NextVersion != tagged.ToString())
+                {
+                    throw new ReleaserException($"{result.Id} {tagged} is tagged at HEAD, but the plan now computes {(result.Release ? result.NextVersion : "no release")}: "
+                                                + "the configuration or history changed since that release. Fix it or delete the tag.");
+                }
+
+                result = result with { Resumed = true, Reasons = ["tagged at HEAD by a previous run: finishing its release", .. result.Reasons] };
             }
 
             planned[state.Package.Id] = result;

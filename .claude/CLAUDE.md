@@ -15,7 +15,8 @@ independently. Namespace: `UnambitiousFx.NugetReleaser`. Solution: `NugetRelease
 - **The plan is the single source of truth**: `Planner` decides every version from data only (no IO); `Releaser`
   only executes it. A dry run must show exactly what a real run does.
 - **Idempotent**: every step skips what already exists (`--skip-duplicate`, existing tags, existing releases), so a
-  failed run is fixed by re-running it.
+  failed run is fixed by re-running it. Order matters: packages, then all tags in one `--atomic` push (which uploads
+  HEAD), then GitHub Releases. Tags at HEAD are left out of the current version and replanned as `Resumed`.
 - **No version in source**: versions come from git tags (`tag_format`) and are injected through a generated
   `versions.props` (`CustomBeforeMicrosoftCommonProps`), never a global `-p:Version`, which would leak into referenced
   projects.

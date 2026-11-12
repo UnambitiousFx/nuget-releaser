@@ -169,47 +169,97 @@ public sealed class ReleaserIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task ReleaseAsync_GitHubFailsThenRerun_ResumesAndTags()
+    public async Task ReleaseAsync_SecondGitHubReleaseFailsThenRerun_FinishesTheRelease()
     {
-        // Given: an origin remote, a local folder feed, and a GitHub API that fails
+        // Given: an origin remote, a local folder feed, per-package GitHub Releases, and a GitHub that fails on the second one
         var origin = Directory.CreateTempSubdirectory("nuget-releaser-origin-").FullName;
         var feed = Directory.CreateTempSubdirectory("nuget-releaser-feed-").FullName;
         _cleanup.AddRange([origin, feed]);
         ProcessRunner.Run(origin, "git", "init", "-q", "--bare");
         Git("remote", "add", "origin", origin);
         Environment.SetEnvironmentVariable("NUGET_RELEASER_TESTS_KEY", "test");
-        var config = new ReleaserConfig { Feed = [new FeedConfig { Name = "local", Source = feed, ApiKeyEnv = "NUGET_RELEASER_TESTS_KEY" }] };
-        var failingGitHub = new GitHubReleases(new HttpClient(new FailingHandler()) { BaseAddress = new Uri("https://api.github.test/") }, "o/r");
+        var config = new ReleaserConfig
+        {
+            Github = new GitHubConfig { ReleaseMode = "per-package" },
+            Feed = [new FeedConfig { Name = "local", Source = feed, ApiKeyEnv = "NUGET_RELEASER_TESTS_KEY" }]
+        };
+        var gitHub = new FakeGitHub(_root) { FailOn = "Lib.Http/v1.0.1" };
         File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        // Committed but never pushed: the release itself must get HEAD to GitHub before creating a release on it.
         Commit("fix: core bug");
         // inside the work tree on purpose: the output directory must not count as an uncommitted change
         var output = Path.Combine(_root, "artifacts");
 
-        // When: the first run fails at the GitHub Release
-        var first = new Releaser(Repository.Open(_root), config, TextWriter.Null, failingGitHub);
+        // When: the first run fails at the second GitHub Release
+        var first = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
         await Assert.ThrowsAsync<ReleaserException>(() => first.ReleaseAsync(first.Plan(), output, dryRun: false));
 
-        // Then: packages are on the feed, but no tag exists, so the plan still lists the release
-        Assert.Contains("lib.core.1.0.1.nupkg", Directory.EnumerateFiles(feed, "*.nupkg", SearchOption.AllDirectories).Select(f => Path.GetFileName(f).ToLowerInvariant()));
-        Assert.Empty(ProcessRunner.Run(_root, "git", "ls-remote", "--tags", "origin").Trim());
+        // Then: packages and tags are published, one GitHub Release is missing
+        Assert.Contains("lib.http.1.0.1.nupkg", Directory.EnumerateFiles(feed, "*.nupkg", SearchOption.AllDirectories).Select(f => Path.GetFileName(f).ToLowerInvariant()));
+        Assert.Contains("refs/tags/Lib.Http/v1.0.1", ProcessRunner.Run(_root, "git", "ls-remote", "--tags", "origin"));
+        Assert.Equal(["Lib.Core/v1.0.1"], gitHub.Releases);
 
         // When: the release is run again
-        var second = new Releaser(Repository.Open(_root), config, TextWriter.Null, null);
+        gitHub.FailOn = null;
+        var second = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
         var plan = second.Plan();
         await second.ReleaseAsync(plan, output, dryRun: false);
 
-        // Then: the same versions are released and tagged, locally and on the remote
-        Assert.Equal(["Lib.Core", "Lib.Http"], plan.Releases.Select(p => p.Id));
-        var remoteTags = ProcessRunner.Run(_root, "git", "ls-remote", "--tags", "origin");
-        Assert.Contains("refs/tags/Lib.Core/v1.0.1", remoteTags);
-        Assert.Contains("refs/tags/Lib.Http/v1.0.1", remoteTags);
-        Assert.Empty(second.Plan().Releases);
+        // Then: the tagged packages are planned again with the same versions, and the missing release is created
+        Assert.Equal([("Lib.Core", "1.0.1", true), ("Lib.Http", "1.0.1", true)], plan.Releases.Select(p => (p.Id, p.NextVersion, p.Resumed)));
+        Assert.Equal(["Lib.Core/v1.0.1", "Lib.Http/v1.0.1"], gitHub.Releases);
+        // Each release was created once its commit and tag were on the remote.
+        Assert.All(gitHub.TagOnRemoteWhenCreated, Assert.True);
     }
 
-    private sealed class FailingHandler : HttpMessageHandler
+    [Fact]
+    public void Plan_NewCommitAfterRelease_ReleasesNormally()
     {
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
-            Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.InternalServerError));
+        // Given: a release fully tagged at its commit, then a new change on top
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+        Git("tag", "Lib.Core/v1.0.1");
+        Git("tag", "Lib.Http/v1.0.1");
+        File.WriteAllText(Path.Combine(_root, "src/Lib/B.cs"), "namespace Lib { public class B { } }");
+        Commit("feat: lib feature");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then: the earlier tags are ordinary tags again, nothing is resumed
+        Assert.Equal([("Lib", "1.1.0", false)], plan.Releases.Select(p => (p.Id, p.NextVersion, p.Resumed)));
+    }
+
+    /// <summary>The GitHub Releases REST endpoints used by <see cref="GitHubReleases" />, in memory.</summary>
+    private sealed class FakeGitHub(string repository) : HttpMessageHandler
+    {
+        public List<string> Releases { get; } = [];
+        public List<bool> TagOnRemoteWhenCreated { get; } = [];
+        public string? FailOn { get; set; }
+
+        public GitHubReleases Client() => new(new HttpClient(this, disposeHandler: false) { BaseAddress = new Uri("https://api.github.test/") }, "o/r");
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            const string byTag = "/releases/tags/";
+            var path = request.RequestUri!.AbsolutePath;
+            if (request.Method == HttpMethod.Get)
+            {
+                var tag = Uri.UnescapeDataString(path[(path.IndexOf(byTag, StringComparison.Ordinal) + byTag.Length)..]);
+                return new HttpResponseMessage(Releases.Contains(tag) ? System.Net.HttpStatusCode.OK : System.Net.HttpStatusCode.NotFound);
+            }
+
+            using var body = System.Text.Json.JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
+            var created = body.RootElement.GetProperty("tag_name").GetString()!;
+            if (created == FailOn)
+            {
+                return new HttpResponseMessage(System.Net.HttpStatusCode.InternalServerError);
+            }
+
+            TagOnRemoteWhenCreated.Add(ProcessRunner.Run(repository, "git", "ls-remote", "--tags", "origin").Contains($"refs/tags/{created}"));
+            Releases.Add(created);
+            return new HttpResponseMessage(System.Net.HttpStatusCode.Created);
+        }
     }
 
     private Releaser Releaser() => new(Repository.Open(_root), new ReleaserConfig(), TextWriter.Null, null);

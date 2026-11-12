@@ -25,7 +25,8 @@ only those, with their git tags and a GitHub Release.
 - **Plan first**: `nuget-releaser plan` prints what would be released and why, without touching anything; `--json`
   gives the same plan to other tools.
 - **Idempotent**: re-running after a partial failure skips packages already on the feed, existing tags and existing
-  GitHub Releases.
+  GitHub Releases. Packages already tagged at the current commit are planned again with the same version
+  (`(resuming)` in `plan`) so the release they belong to is finished.
 - **Native AOT ready**: starts in milliseconds in CI.
 
 ## 📦 Installation

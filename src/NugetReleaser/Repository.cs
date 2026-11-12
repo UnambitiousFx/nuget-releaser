@@ -89,6 +89,10 @@ internal sealed class Repository
     public bool TagExists(string tag) =>
         Git(Root, "tag", "--list", tag).Trim().Length > 0;
 
+    /// <summary>Tags on the HEAD commit itself: what a previous run of this commit already released.</summary>
+    public IReadOnlyList<string> TagsAtHead() =>
+        Git(Root, "tag", "--points-at", "HEAD").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
     /// <summary>
     ///     Lightweight tags, so pushing a tag GitHub already created for a release at the same commit is a no-op
     ///     and an interrupted release can be re-run.
@@ -96,8 +100,9 @@ internal sealed class Repository
     public void CreateTag(string tag, string commit) =>
         Git(Root, "tag", tag, commit);
 
+    /// <summary>Pushes every tag or none (<c>--atomic</c>), uploading <paramref name="commit" /> with them.</summary>
     public void PushTags(IEnumerable<string> tags, string commit) =>
-        Git(Root, ["push", "origin", .. tags.Select(t => $"{commit}:refs/tags/{t}")]);
+        Git(Root, ["push", "--atomic", "origin", .. tags.Select(t => $"{commit}:refs/tags/{t}")]);
 
     public string? OriginUrl()
     {

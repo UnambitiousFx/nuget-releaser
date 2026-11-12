@@ -94,6 +94,34 @@ public sealed class PlannerTests
     }
 
     [Fact]
+    public void Plan_TaggedAtHead_IsResumedWithTheSameVersion()
+    {
+        // Given: a previous run of this commit tagged A 1.1.0 (left out of Current)
+        var states = new[] { State("A", "1.0.0", ["feat: a"]) with { TaggedAtHead = new SemVersion(1, 1, 0) } };
+
+        // When
+        var a = Assert.Single(Planner.Plan(states, Initial).Packages);
+
+        // Then
+        Assert.True(a.Release);
+        Assert.True(a.Resumed);
+        Assert.Equal("1.1.0", a.NextVersion);
+    }
+
+    [Fact]
+    public void Plan_TaggedAtHeadWithAnotherVersion_Throws()
+    {
+        // Given: the tag at HEAD says 2.0.0, the history says 1.0.1
+        var states = new[] { State("A", "1.0.0", ["fix: a"]) with { TaggedAtHead = new SemVersion(2, 0, 0) } };
+
+        // When
+        var error = Assert.Throws<ReleaserException>(() => Planner.Plan(states, Initial));
+
+        // Then
+        Assert.Contains("tagged at HEAD", error.Message);
+    }
+
+    [Fact]
     public void Plan_Cycle_Throws()
     {
         // Given
