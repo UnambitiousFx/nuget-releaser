@@ -213,6 +213,19 @@ public sealed class ReleaserIntegrationTests : IDisposable
     }
 
     [Fact]
+    public void Plan_ExistingTagsAtHead_AreExistingReleases()
+    {
+        // Given: the fixture as is, every package tagged v1.0.0 on HEAD, as when adopting the tool on a tagged repository
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then
+        Assert.Empty(plan.Releases);
+        Assert.All(plan.Packages, p => Assert.Equal("1.0.0", p.CurrentVersion));
+    }
+
+    [Fact]
     public void Plan_NewCommitAfterRelease_ReleasesNormally()
     {
         // Given: a release fully tagged at its commit, then a new change on top

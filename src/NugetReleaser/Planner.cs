@@ -36,7 +36,34 @@ internal sealed record ReleasePlan(IReadOnlyList<PlannedPackage> Packages)
 
 internal static class Planner
 {
+    /// <summary>
+    ///     A tag at HEAD is resumed only when planning without it gives back exactly its version: that is the release a
+    ///     previous run started. Otherwise it is an existing release (a manual tag, another tool's): the package is
+    ///     replanned from that tag, which can change the cascade, until no tag at HEAD is left in doubt.
+    /// </summary>
     public static ReleasePlan Plan(IReadOnlyList<PackageState> states, SemVersion initialVersion)
+    {
+        while (true)
+        {
+            var plan = PlanOnce(states, initialVersion);
+            var byId = plan.Packages.ToDictionary(p => p.Id);
+            var existing = states
+                .Where(s => s.TaggedAtHead is { } tagged && (!byId[s.Package.Id].Release || byId[s.Package.Id].NextVersion != tagged.ToString()))
+                .Select(s => s.Package.Id)
+                .ToHashSet();
+            if (existing.Count == 0)
+            {
+                return new ReleasePlan([.. plan.Packages.Select(p => states.Single(s => s.Package.Id == p.Id).TaggedAtHead is null
+                    ? p
+                    : p with { Resumed = true, Reasons = ["tagged at HEAD by a previous run: finishing its release", .. p.Reasons] })]);
+            }
+
+            // Tagged at HEAD: no commit since.
+            states = [.. states.Select(s => existing.Contains(s.Package.Id) ? s with { Current = s.TaggedAtHead, Commits = [], TaggedAtHead = null } : s)];
+        }
+    }
+
+    private static ReleasePlan PlanOnce(IReadOnlyList<PackageState> states, SemVersion initialVersion)
     {
         var planned = new Dictionary<string, PlannedPackage>();
         foreach (var state in TopologicalOrder(states))
@@ -73,17 +100,6 @@ internal static class Planner
                 var release = bump != Bump.None;
                 result = new PlannedPackage(state.Package.Id, state.Package.Project, current.ToString(),
                     current.Increment(bump).ToString(), bump, release, release ? reasons : [], state.Commits);
-            }
-
-            if (state.TaggedAtHead is { } tagged)
-            {
-                if (!result.Release || result.NextVersion != tagged.ToString())
-                {
-                    throw new ReleaserException($"{result.Id} {tagged} is tagged at HEAD, but the plan now computes {(result.Release ? result.NextVersion : "no release")}: "
-                                                + "the configuration or history changed since that release. Fix it or delete the tag.");
-                }
-
-                result = result with { Resumed = true, Reasons = ["tagged at HEAD by a previous run: finishing its release", .. result.Reasons] };
             }
 
             planned[state.Package.Id] = result;

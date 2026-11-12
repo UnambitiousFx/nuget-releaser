@@ -109,16 +109,35 @@ public sealed class PlannerTests
     }
 
     [Fact]
-    public void Plan_TaggedAtHeadWithAnotherVersion_Throws()
+    public void Plan_TaggedAtHeadWithAnotherVersion_IsAnExistingRelease()
     {
-        // Given: the tag at HEAD says 2.0.0, the history says 1.0.1
-        var states = new[] { State("A", "1.0.0", ["fix: a"]) with { TaggedAtHead = new SemVersion(2, 0, 0) } };
+        // Given: adopting the tool on a repository whose only tag, A 1.0.0, is on HEAD (planning without it gives 0.1.0)
+        var states = new[] { State("A", null, ["chore: setup"]) with { TaggedAtHead = new SemVersion(1, 0, 0) } };
 
         // When
-        var error = Assert.Throws<ReleaserException>(() => Planner.Plan(states, Initial));
+        var a = Assert.Single(Planner.Plan(states, Initial).Packages);
 
         // Then
-        Assert.Contains("tagged at HEAD", error.Message);
+        Assert.False(a.Release);
+        Assert.False(a.Resumed);
+        Assert.Equal("1.0.0", a.CurrentVersion);
+    }
+
+    [Fact]
+    public void Plan_ExistingTagAtHead_NoLongerCascadesToDependents()
+    {
+        // Given: B depends on A; A 1.0.0 is a manual tag at HEAD, B 1.0.0 an older release with no change since
+        var states = new[]
+        {
+            State("B", "1.0.0", [], "A"),
+            State("A", null, ["chore: setup"]) with { TaggedAtHead = new SemVersion(1, 0, 0) }
+        };
+
+        // When
+        var plan = Planner.Plan(states, Initial);
+
+        // Then: A is not a first release, so B has nothing to cascade
+        Assert.Empty(plan.Releases);
     }
 
     [Fact]
