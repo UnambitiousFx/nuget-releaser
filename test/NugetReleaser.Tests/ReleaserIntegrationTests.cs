@@ -23,7 +23,16 @@ public sealed class ReleaserIntegrationTests : IDisposable
         Git("tag", "Lib.Http/v1.0.0");
     }
 
-    public void Dispose() => Directory.Delete(_root, true);
+    public void Dispose()
+    {
+        // git writes its objects read-only, and Windows refuses to delete read-only files.
+        foreach (var file in Directory.EnumerateFiles(_root, "*", SearchOption.AllDirectories))
+        {
+            File.SetAttributes(file, FileAttributes.Normal);
+        }
+
+        Directory.Delete(_root, true);
+    }
 
     [Fact]
     public void Plan_NothingChangedSinceTags_ReleasesNothing()

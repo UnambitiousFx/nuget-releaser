@@ -53,6 +53,7 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
+      # CI=true turns on GeneratePackageOnBuild (src/Directory.Build.props), which a Native AOT publish rejects.
       - name: Publish Native AOT
         run: >
           dotnet publish src/NugetReleaser/NugetReleaser.csproj
@@ -60,6 +61,7 @@ jobs:
           --runtime ${{ matrix.rid }}
           -p:PublishAot=true
           -p:Version=${{ inputs.version }}
+          -p:GeneratePackageOnBuild=false
           --output ./publish
 
       - name: Stage
