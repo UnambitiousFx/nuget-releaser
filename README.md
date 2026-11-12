@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/UnambitiousFx/nuget-releaser)](https://github.com/UnambitiousFx/nuget-releaser/releases/latest)
 [![codecov](https://codecov.io/gh/UnambitiousFx/nuget-releaser/branch/main/graph/badge.svg)](https://codecov.io/gh/UnambitiousFx/nuget-releaser)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![.NET](https://img.shields.io/badge/.NET-10.0-blue.svg)](https://dotnet.microsoft.com/download)
+[![.NET](https://img.shields.io/badge/.NET-11.0-blue.svg)](https://dotnet.microsoft.com/download)
 
 A goreleaser-style release tool for .NET repositories that ship several NuGet packages: it versions, packs and
 publishes **each package independently**.

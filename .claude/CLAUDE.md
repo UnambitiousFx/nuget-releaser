@@ -32,7 +32,7 @@ independently. Namespace: `UnambitiousFx.NugetReleaser`. Solution: `NugetRelease
 - Naming: `PascalCase` (public/types/methods), `camelCase` (params/locals), `_camelCase` (private fields), `IPascalCase` (interfaces).
 - Always use braces, even single statements.
 - Types are `internal` (the tool has no public API); tests see them through `InternalsVisibleTo`.
-- Targets `net10.0` (`LatestTargetFramework` in `build.props`), `RollForward=Major`.
+- Targets `net11.0` (`LatestTargetFramework` in `build.props`), `RollForward=Major`.
 - Central Package Management: add/bump versions in `Directory.Packages.props`, not in `.csproj`.
 
 ## Testing

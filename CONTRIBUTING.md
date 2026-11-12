@@ -36,7 +36,7 @@ release (see [Release Process](#release-process)).
 
 ### Prerequisites
 
-- [.NET 10 SDK](https://dotnet.microsoft.com/download) and git
+- [.NET 11 SDK](https://dotnet.microsoft.com/download) and git
 - An IDE: [JetBrains Rider](https://www.jetbrains.com/rider/), [Visual Studio](https://visualstudio.microsoft.com/), or
   [VS Code](https://code.visualstudio.com/)
 
