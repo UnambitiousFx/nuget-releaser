@@ -6,7 +6,7 @@ Security fixes are released for the latest minor version of the current major ve
 
 | Version | Supported |
 |---|---|
-| 0.x (latest minor) | ✅ |
+| 1.x (latest minor) | ✅ |
 | Older versions | ❌ |
 
 Releases are automatic: a fix merged on `main` is published as a GitHub release within minutes. Update to the latest version
