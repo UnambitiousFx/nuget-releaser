@@ -169,6 +169,47 @@ public sealed class ReleaserIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task ReleaseAsync_SourceFileMovedIntoOutput_RefusesToPublish()
+    {
+        // Given: a committed fix, then that file staged as moved into the output directory
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+        Git("config", "status.renames", "true");
+        Directory.CreateDirectory(Path.Combine(_root, "artifacts"));
+        Git("mv", "src/Lib.Core/A.cs", "artifacts/A.cs");
+        var releaser = Releaser();
+
+        // When
+        var error = await Assert.ThrowsAsync<ReleaserException>(() =>
+            releaser.ReleaseAsync(releaser.Plan(), Path.Combine(_root, "artifacts"), dryRun: false));
+
+        // Then: HEAD still has src/Lib.Core/A.cs, which the pack would leave out
+        Assert.Contains("src/Lib.Core/A.cs", error.Message);
+    }
+
+    [Fact]
+    public void UncommittedChanges_NonAsciiPaths_AreReportedVerbatimAndOutputIsExcluded()
+    {
+        // Given: an output directory with a non-ASCII name holding a file, an untracked non-ASCII file,
+        // and a staged rename (two NUL-separated paths with -z)
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { }");
+        Commit("chore: add a");
+        // Reported as a rename whatever the user's git config says.
+        Git("config", "status.renames", "true");
+        Git("mv", "src/Lib.Core/A.cs", "src/Lib.Core/Ä.cs");
+        File.WriteAllText(Path.Combine(_root, "src/Lib/Café.cs"), "namespace Lib { }");
+        var output = Path.Combine(_root, "artifacts", "é");
+        Directory.CreateDirectory(output);
+        File.WriteAllText(Path.Combine(output, "Lib.1.0.0.nupkg"), "x");
+
+        // When
+        var changes = Repository.Open(_root).UncommittedChanges(output);
+
+        // Then
+        Assert.Equal(["src/Lib.Core/Ä.cs", "src/Lib/Café.cs"], changes);
+    }
+
+    [Fact]
     public async Task ReleaseAsync_SecondGitHubReleaseFailsThenRerun_FinishesTheRelease()
     {
         // Given: an origin remote, a local folder feed, per-package GitHub Releases, and a GitHub that fails on the second one
