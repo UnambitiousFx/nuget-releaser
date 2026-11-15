@@ -23,11 +23,18 @@ internal sealed class Repository
 
     public string Head => Git(Root, "rev-parse", "HEAD").Trim();
 
-    /// <summary>Every tracked project with <c>IsPackable=true</c>, read through MSBuild evaluation.</summary>
+    /// <summary>
+    ///     Every tracked project with <c>IsPackable=true</c>, read through MSBuild evaluation. A package's paths are its
+    ///     directory, its <c>extra_paths</c>, the <c>shared_paths</c>, and every tracked file MSBuild imports for it.
+    /// </summary>
     public IReadOnlyList<PackageInfo> DiscoverPackages(ReleaserConfig config)
     {
-        var projects = Git(Root, "ls-files", "-z", "--", "*.csproj")
+        var tracked = Git(Root, "ls-files", "-z")
             .Split('\0', StringSplitOptions.RemoveEmptyEntries)
+            .ToHashSet(StringComparer.Ordinal);
+        var projects = tracked
+            .Where(p => p.EndsWith(".csproj", StringComparison.Ordinal))
+            .Order(StringComparer.Ordinal)
             .Select(p => Path.GetFullPath(Path.Combine(Root, p)))
             .ToList();
 
@@ -58,8 +65,13 @@ internal sealed class Repository
                     : throw new ReleaserException($"{project.PackageId} references {Relative(reference)}, which is not packable: it could not be restored from the feed."));
 
             var extraPaths = overrides.TryGetValue(project.FullPath, out var o) ? o.ExtraPaths : [];
-            List<string> paths = [Relative(Path.GetDirectoryName(project.FullPath)!), .. extraPaths, .. config.Defaults.SharedPaths];
-            return new PackageInfo(project.PackageId, Relative(project.FullPath), [.. dependencies.Distinct()], paths);
+            var directory = Relative(Path.GetDirectoryName(project.FullPath)!);
+            // Inside the repository and tracked: SDK files, and what restore writes to obj/, never change in a commit.
+            var imports = project.Imports
+                .Select(Relative)
+                .Where(path => tracked.Contains(path) && !path.StartsWith(directory + "/", StringComparison.Ordinal));
+            List<string> paths = [directory, .. extraPaths, .. config.Defaults.SharedPaths, .. imports];
+            return new PackageInfo(project.PackageId, Relative(project.FullPath), [.. dependencies.Distinct()], [.. paths.Distinct(StringComparer.Ordinal)]);
         }).ToList();
     }
 
@@ -123,13 +135,20 @@ internal sealed class Repository
 
     /// <summary>
     ///     Evaluated as <c>dotnet pack</c> sees it: Release, and once per target framework, since a
-    ///     <c>ProjectReference</c> conditioned on <c>$(TargetFramework)</c> is invisible to the outer build.
+    ///     <c>ProjectReference</c> or an <c>Import</c> conditioned on <c>$(TargetFramework)</c> is invisible to the outer build.
+    ///     Imports are read only for a packable project: they are what makes a change release it.
     /// </summary>
     private EvaluatedProject Evaluate(string fullPath)
     {
         using var document = MsBuild(fullPath, null, "-getProperty:IsPackable", "-getProperty:PackageId", "-getProperty:TargetFrameworks");
         var properties = document.RootElement.GetProperty("Properties");
+        var isPackable = string.Equals(properties.GetProperty("IsPackable").GetString(), "true", StringComparison.OrdinalIgnoreCase);
         var references = References(document);
+        var imports = new HashSet<string>(StringComparer.Ordinal);
+        if (isPackable)
+        {
+            imports.UnionWith(Imports(fullPath, null));
+        }
 
         var targetFrameworks = properties.GetProperty("TargetFrameworks").GetString()!
             .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -137,29 +156,47 @@ internal sealed class Repository
         {
             using var inner = MsBuild(fullPath, targetFramework);
             references.UnionWith(References(inner));
+            if (isPackable)
+            {
+                imports.UnionWith(Imports(fullPath, targetFramework));
+            }
         }
 
         return new EvaluatedProject(
             fullPath,
             properties.GetProperty("PackageId").GetString()!,
-            string.Equals(properties.GetProperty("IsPackable").GetString(), "true", StringComparison.OrdinalIgnoreCase),
-            [.. references.Order(StringComparer.Ordinal)]);
+            isPackable,
+            [.. references.Order(StringComparer.Ordinal)],
+            [.. imports.Order(StringComparer.Ordinal)]);
     }
 
     private JsonDocument MsBuild(string fullPath, string? targetFramework, params string[] properties) =>
         JsonDocument.Parse(ProcessRunner.Run(Root, "dotnet",
         [
-            "msbuild", fullPath, "-p:Configuration=Release",
-            .. targetFramework is null ? Array.Empty<string>() : [$"-p:TargetFramework={targetFramework}"],
+            "msbuild", fullPath, "-p:Configuration=Release", .. TargetFramework(targetFramework),
             .. properties, "-getItem:ProjectReference"
         ]));
+
+    /// <summary>
+    ///     Every file the evaluation imported, read from <c>-preprocess</c>: it marks each import with a comment holding
+    ///     the file's full path on a line of its own. <c>-getProperty</c> turns <c>-preprocess</c> off, hence a call of its own;
+    ///     <c>MSBuildAllProjects</c> is no substitute, recent SDKs no longer list <c>Directory.Build.props</c> in it.
+    /// </summary>
+    private IEnumerable<string> Imports(string fullPath, string? targetFramework) =>
+        ProcessRunner.Run(Root, "dotnet", ["msbuild", fullPath, "-p:Configuration=Release", .. TargetFramework(targetFramework), "-preprocess"])
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(line => Path.IsPathFullyQualified(line) && File.Exists(line))
+            .Select(Path.GetFullPath);
+
+    private static string[] TargetFramework(string? targetFramework) =>
+        targetFramework is null ? [] : [$"-p:TargetFramework={targetFramework}"];
 
     private static HashSet<string> References(JsonDocument document) =>
         document.RootElement.TryGetProperty("Items", out var items) && items.TryGetProperty("ProjectReference", out var refs)
             ? refs.EnumerateArray().Select(r => Path.GetFullPath(r.GetProperty("FullPath").GetString()!)).ToHashSet(StringComparer.Ordinal)
             : new HashSet<string>(StringComparer.Ordinal);
 
-    private sealed record EvaluatedProject(string FullPath, string PackageId, bool IsPackable, List<string> References);
+    private sealed record EvaluatedProject(string FullPath, string PackageId, bool IsPackable, List<string> References, List<string> Imports);
 }
 
 /// <summary>Turns <c>tag_format</c> (<c>{package}/v{version}</c>) into tag names and back.</summary>

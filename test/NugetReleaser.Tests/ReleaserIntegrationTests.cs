@@ -73,6 +73,80 @@ public sealed class ReleaserIntegrationTests : IDisposable
     }
 
     [Fact]
+    public void Plan_NestedDirectoryBuildPropsChange_ReleasesThePackagesBelowIt()
+    {
+        // Given: src/Directory.Build.props, not a default shared path, imports build/common.props
+        File.WriteAllText(Path.Combine(_root, "src/Directory.Build.props"), """<Project><Import Project="../build/common.props" /></Project>""");
+        BuildFile("build/common.props", "<Project />");
+        CommitAndTagAll("build: shared settings", "1.0.1");
+        BuildFile("build/common.props", "<Project><PropertyGroup><Authors>me</Authors></PropertyGroup></Project>");
+        Commit("fix: package authors");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then
+        Assert.Equal(["Lib", "Lib.Core", "Lib.Http"], plan.Releases.Select(p => p.Id).Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public void Plan_FileImportedByOneProject_ReleasesOnlyThatPackage()
+    {
+        // Given: only Lib imports build/lib.targets
+        Project("src/Lib/Lib.csproj", """<Import Project="../../build/lib.targets" />""");
+        BuildFile("build/lib.targets", "<Project />");
+        CommitAndTagAll("build: lib targets", "1.0.1");
+        BuildFile("build/lib.targets", """<Project><Target Name="Noop" /></Project>""");
+        Commit("fix: lib targets");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then
+        Assert.Equal([("Lib", "1.0.2")], plan.Releases.Select(p => (p.Id, p.NextVersion)));
+    }
+
+    [Fact]
+    public void Plan_FileImportedForOneTargetFrameworkOnly_ReleasesThePackage()
+    {
+        // Given: Lib.Core imports build/net8.targets only when building for net8.0
+        BuildFile("src/Lib.Core/Lib.Core.csproj", """
+                                                  <Project Sdk="Microsoft.NET.Sdk">
+                                                    <PropertyGroup><TargetFrameworks>netstandard2.0;net8.0</TargetFrameworks></PropertyGroup>
+                                                    <Import Project="../../build/net8.targets" Condition="'$(TargetFramework)' == 'net8.0'" />
+                                                  </Project>
+                                                  """);
+        BuildFile("build/net8.targets", "<Project />");
+        CommitAndTagAll("build: net8 targets", "1.0.1");
+        BuildFile("build/net8.targets", """<Project><Target Name="Noop" /></Project>""");
+        Commit("fix: net8 targets");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then: Lib.Http follows its dependency
+        Assert.Equal(["Lib.Core", "Lib.Http"], plan.Releases.Select(p => p.Id).Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public void Plan_UntrackedImportedFile_IsIgnored()
+    {
+        // Given: Lib imports a file that git ignores (as obj/*.nuget.g.props, written by restore)
+        File.AppendAllText(Path.Combine(_root, ".gitignore"), "generated/\n");
+        Project("src/Lib/Lib.csproj", """<Import Project="../../generated/lib.props" Condition="Exists('../../generated/lib.props')" />""");
+        BuildFile("generated/lib.props", "<Project />");
+        CommitAndTagAll("build: generated props", "1.0.1");
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+
+        // When
+        var lib = Repository.Open(_root).DiscoverPackages(new ReleaserConfig()).Single(p => p.Id == "Lib");
+
+        // Then
+        Assert.DoesNotContain("generated/lib.props", lib.Paths);
+    }
+
+    [Fact]
     public void Plan_SharedFileChange_ReleasesEveryPackage()
     {
         // Given
@@ -487,6 +561,23 @@ public sealed class ReleaserIntegrationTests : IDisposable
         var fullPath = Path.Combine(_root, path);
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
         File.WriteAllText(fullPath, $"""<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>netstandard2.0</TargetFramework></PropertyGroup>{content}</Project>""");
+    }
+
+    private void BuildFile(string path, string content)
+    {
+        var fullPath = Path.Combine(_root, path);
+        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+        File.WriteAllText(fullPath, content);
+    }
+
+    /// <summary>Commits, then tags every package at <paramref name="version" />, as a release of that commit would.</summary>
+    private void CommitAndTagAll(string message, string version)
+    {
+        Commit(message);
+        foreach (var id in new[] { "Lib", "Lib.Core", "Lib.Http" })
+        {
+            Git("tag", $"{id}/v{version}");
+        }
     }
 
     private void Commit(string message)

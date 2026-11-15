@@ -17,8 +17,9 @@ only those, with their git tags and a GitHub Release.
 
 - **Per-package versioning**: each packable project has its own SemVer version, tracked by its own git tag
   (`Synapse.Core/v1.4.0`). No version lives in source; it is injected at pack time.
-- **Change detection**: a package is released only when a commit touched its folder, its `extra_paths` or a shared
-  build file (`Directory.Build.props`, `Directory.Packages.props`, `global.json`) since its last tag.
+- **Change detection**: a package is released only when a commit touched its folder, its `extra_paths`, a build file
+  MSBuild imports for it (any tracked `Directory.Build.props`, `.props` or `.targets`, for every target framework) or
+  a `shared_paths` file since its last tag.
 - **Conventional commits**: `feat` → minor, `fix`/`perf` → patch, `!` or a `BREAKING CHANGE:` footer → major.
 - **Dependency propagation**: when a package is released, every package that references it through `ProjectReference`
   is re-released against the new version; a major bump cascades as at least a minor bump.
@@ -84,7 +85,7 @@ the defaults below apply.
 [defaults]
 tag_format = "{package}/v{version}"
 initial_version = "0.1.0"          # version of a package that has no tag yet
-shared_paths = ["Directory.Build.props", "Directory.Packages.props", "global.json"]
+shared_paths = ["Directory.Build.props", "Directory.Packages.props", "global.json"]  # plus what MSBuild imports; list files it does not, such as NuGet.config
 
 [[package]]
 project = "src/Synapse.Http/Synapse.Http.csproj"
