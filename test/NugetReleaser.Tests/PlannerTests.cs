@@ -5,7 +5,7 @@ public sealed class PlannerTests
     private static readonly SemVersion Initial = new(0, 1, 0);
 
     private static PackageState State(string id, string? current, string[] messages, params string[] dependencies) =>
-        new(new PackageInfo(id, $"src/{id}/{id}.csproj", dependencies, [$"src/{id}"]),
+        new(new PackageInfo(id, $"src/{id}/{id}.csproj", dependencies, [$"src/{id}"], []),
             current is null ? null : SemVersion.Parse(current),
             [.. messages.Select((m, i) => new Commit($"{id}{i}000000", m))]);
 

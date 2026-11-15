@@ -2,8 +2,12 @@ using System.Text.Json.Serialization;
 
 namespace UnambitiousFx.NugetReleaser;
 
-/// <summary>A packable project, with the package ids it references through <c>ProjectReference</c>.</summary>
-internal sealed record PackageInfo(string Id, string Project, IReadOnlyList<string> Dependencies, IReadOnlyList<string> Paths);
+/// <summary>
+///     A packable project, with the package ids it references through <c>ProjectReference</c>. A commit touching
+///     <see cref="Paths" /> changes the package; so does one deleting a <see cref="LocatedImports" /> file: MSBuild imports
+///     those by location, so deleting one changes the build without touching anything still imported.
+/// </summary>
+internal sealed record PackageInfo(string Id, string Project, IReadOnlyList<string> Dependencies, IReadOnlyList<string> Paths, IReadOnlyList<string> LocatedImports);
 
 /// <summary>
 ///     A package with its last released version (<c>null</c> if never released) and the commits since.

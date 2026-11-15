@@ -90,6 +90,39 @@ public sealed class ReleaserIntegrationTests : IDisposable
     }
 
     [Fact]
+    public void Plan_NestedDirectoryBuildPropsDeleted_ReleasesThePackagesBelowIt()
+    {
+        // Given: src/Directory.Build.props is released with every package, then deleted on its own
+        File.WriteAllText(Path.Combine(_root, "src/Directory.Build.props"), "<Project><PropertyGroup><Authors>me</Authors></PropertyGroup></Project>");
+        CommitAndTagAll("build: shared settings", "1.0.1");
+        File.Delete(Path.Combine(_root, "src/Directory.Build.props"));
+        Commit("fix: drop shared settings");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then: nothing the packages still import changed, but what they build with did
+        Assert.Equal(["Lib", "Lib.Core", "Lib.Http"], plan.Releases.Select(p => p.Id).Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public void Plan_ShadowedDirectoryBuildPropsChanged_ReleasesNothing()
+    {
+        // Given: src/Lib/../Directory.Build.props exists but src/Lib.Core has its own, which does not import it
+        File.WriteAllText(Path.Combine(_root, "src/Directory.Build.props"), "<Project />");
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/Directory.Build.props"), "<Project />");
+        CommitAndTagAll("build: settings", "1.0.1");
+        File.WriteAllText(Path.Combine(_root, "src/Directory.Build.props"), "<Project><PropertyGroup><Authors>me</Authors></PropertyGroup></Project>");
+        Commit("fix: authors");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then: Lib.Core's own Directory.Build.props stops MSBuild's search, so only Lib and Lib.Http import the changed file
+        Assert.Equal(["Lib", "Lib.Http"], plan.Releases.Select(p => p.Id).Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
     public void Plan_FileImportedByOneProject_ReleasesOnlyThatPackage()
     {
         // Given: only Lib imports build/lib.targets

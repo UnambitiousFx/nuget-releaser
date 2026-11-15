@@ -23,7 +23,7 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
         {
             var latest = TagFormat.Latest(config.Defaults.TagFormat, package.Id, tags);
             var tagged = TagFormat.Latest(config.Defaults.TagFormat, package.Id, tagsAtHead);
-            return new PackageState(package, latest?.Version, repository.CommitsSince(latest?.Tag, package.Paths), tagged?.Version);
+            return new PackageState(package, latest?.Version, repository.CommitsSince(latest?.Tag, package.Paths, package.LocatedImports),tagged?.Version);
         }).ToList();
 
         return Planner.Plan(states, SemVersion.Parse(config.Defaults.InitialVersion));

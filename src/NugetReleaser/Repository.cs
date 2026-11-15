@@ -71,7 +71,8 @@ internal sealed class Repository
                 .Select(Relative)
                 .Where(path => tracked.Contains(path) && !path.StartsWith(directory + "/", StringComparison.Ordinal));
             List<string> paths = [directory, .. extraPaths, .. config.Defaults.SharedPaths, .. imports];
-            return new PackageInfo(project.PackageId, Relative(project.FullPath), [.. dependencies.Distinct()], [.. paths.Distinct(StringComparer.Ordinal)]);
+            return new PackageInfo(project.PackageId, Relative(project.FullPath), [.. dependencies.Distinct()],
+                [.. paths.Distinct(StringComparer.Ordinal)], LocatedImports(directory));
         }).ToList();
     }
 
@@ -90,13 +91,51 @@ internal sealed class Repository
             .ToList();
     }
 
-    /// <summary>Commits reachable from HEAD but not from <paramref name="since" /> that touch one of <paramref name="paths" />.</summary>
-    public IReadOnlyList<Commit> CommitsSince(string? since, IEnumerable<string> paths) =>
-        Git(Root, ["log", "--format=%H%x1f%B%x1e", since is null ? "HEAD" : $"{since}..HEAD", "--", .. paths])
+    /// <summary>
+    ///     Commits reachable from HEAD but not from <paramref name="since" /> that touch one of <paramref name="paths" />
+    ///     or delete one of <paramref name="deletedPaths" />, newest first.
+    /// </summary>
+    public IReadOnlyList<Commit> CommitsSince(string? since, IReadOnlyList<string> paths, IReadOnlyList<string> deletedPaths)
+    {
+        var range = since is null ? "HEAD" : $"{since}..HEAD";
+        var deletions = deletedPaths.Count == 0
+            ? []
+            : Git(Root, ["log", "--format=%H", "--diff-filter=D", range, "--", .. deletedPaths])
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .ToHashSet(StringComparer.Ordinal);
+        if (deletions.Count == 0)
+        {
+            return Log(range, paths);
+        }
+
+        // One log over both, filtered, keeps history order; a change to a file that was not deleted stays out.
+        var touching = Log(range, paths).Select(c => c.Sha).ToHashSet(StringComparer.Ordinal);
+        return Log(range, [.. paths, .. deletedPaths]).Where(c => touching.Contains(c.Sha) || deletions.Contains(c.Sha)).ToList();
+    }
+
+    private List<Commit> Log(string range, IReadOnlyList<string> paths) =>
+        Git(Root, ["log", "--format=%H%x1f%B%x1e", range, "--", .. paths])
             .Split('\x1e', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(entry => entry.Split('\x1f', 2))
             .Select(parts => new Commit(parts[0], parts[1].Trim()))
             .ToList();
+
+    /// <summary>
+    ///     The files MSBuild would import by location for a project in <paramref name="directory" />: each
+    ///     <c>Directory.Build.props</c>, <c>Directory.Build.targets</c> and <c>Directory.Packages.props</c> above it, up
+    ///     to the repository root. Present ones are already among its imports; this list is for the deleted ones.
+    /// </summary>
+    private static List<string> LocatedImports(string directory)
+    {
+        var located = new List<string>();
+        for (var parent = Path.GetDirectoryName(directory); parent is not null; parent = Path.GetDirectoryName(parent))
+        {
+            var prefix = parent.Length == 0 ? "" : parent.Replace('\\', '/') + "/";
+            located.AddRange([$"{prefix}Directory.Build.props", $"{prefix}Directory.Build.targets", $"{prefix}Directory.Packages.props"]);
+        }
+
+        return located;
+    }
 
     public bool TagExists(string tag) =>
         Git(Root, "tag", "--list", tag).Trim().Length > 0;
