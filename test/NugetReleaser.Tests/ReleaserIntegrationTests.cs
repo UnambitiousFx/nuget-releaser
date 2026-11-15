@@ -264,8 +264,164 @@ public sealed class ReleaserIntegrationTests : IDisposable
         Assert.Equal([("Lib", "1.1.0", false)], plan.Releases.Select(p => (p.Id, p.NextVersion, p.Resumed)));
     }
 
-    /// <summary>A bare <c>origin</c> remote, and a local folder feed with per-package GitHub Releases.</summary>
-    private (ReleaserConfig Config, string Feed) Publishing()
+    [Fact]
+    public async Task ReleaseAsync_RunTwice_SecondRunPublishesNothingNew()
+    {
+        // Given: a complete release, to an HTTP feed that refuses duplicates as nuget.org does
+        var (config, _) = Publishing();
+        using var feed = new FakeNuGetFeed();
+        config.Feed = [new FeedConfig { Name = "http", Source = feed.Source, ApiKeyEnv = "NUGET_RELEASER_TESTS_KEY" }];
+        feed.AllowIn(_root);
+        var gitHub = new FakeGitHub(_root);
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+        var output = Path.Combine(_root, "artifacts");
+        var first = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        await first.ReleaseAsync(first.Plan(), output, dryRun: false);
+        var tagsAfterFirst = RemoteTags();
+
+        // When: the release is run again on the same commit
+        var log = new StringWriter();
+        var second = new Releaser(Repository.Open(_root), config, log, gitHub.Client());
+        await second.ReleaseAsync(second.Plan(), output, dryRun: false);
+
+        // Then: the duplicate packages are skipped, and the remote tags and the GitHub Releases are unchanged
+        Assert.Equal(["Lib.Core", "Lib.Http"], feed.Published);
+        Assert.Equal(["Lib.Core", "Lib.Http"], feed.Conflicts);
+        Assert.All(feed.ApiKeys, k => Assert.Equal("test", k));
+        Assert.Equal(tagsAfterFirst, RemoteTags());
+        Assert.Equal(["Lib.Core/v1.0.1", "Lib.Http/v1.0.1"], gitHub.Releases);
+        Assert.Equal(2, gitHub.Posts);
+        Assert.Contains("GitHub Release Lib.Core/v1.0.1 already exists", log.ToString());
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_TagPushFailsThenRerun_FinishesTheRelease()
+    {
+        // Given: an origin that cannot be reached, so the run stops after the packages are pushed and before any tag
+        var (config, _) = Publishing();
+        using var feed = new FakeNuGetFeed();
+        config.Feed = [new FeedConfig { Name = "http", Source = feed.Source, ApiKeyEnv = "NUGET_RELEASER_TESTS_KEY" }];
+        feed.AllowIn(_root);
+        var origin = Git("remote", "get-url", "origin").Trim();
+        Git("remote", "set-url", "origin", Path.Combine(_root, "missing-origin.git"));
+        var gitHub = new FakeGitHub(_root);
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+        var output = Path.Combine(_root, "artifacts");
+
+        // When: the first run fails at the tag push
+        var first = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        await Assert.ThrowsAsync<ReleaserException>(() => first.ReleaseAsync(first.Plan(), output, dryRun: false));
+
+        // Then: the packages are on the feed, but no tag and no GitHub Release exist
+        Assert.Equal(["Lib.Core", "Lib.Http"], feed.Published);
+        Assert.Empty(Git("tag", "--list", "*1.0.1").Trim());
+        Assert.Empty(gitHub.Releases);
+
+        // When: origin is back and the release is run again
+        Git("remote", "set-url", "origin", origin);
+        var second = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        var plan = second.Plan();
+        await second.ReleaseAsync(plan, output, dryRun: false);
+
+        // Then: the same versions are planned, the duplicate packages are skipped, and the tags and releases are created
+        Assert.Equal([("Lib.Core", "1.0.1"), ("Lib.Http", "1.0.1")], plan.Releases.Select(p => (p.Id, p.NextVersion)));
+        Assert.Equal(["Lib.Core", "Lib.Http"], feed.Conflicts);
+        Assert.Equal(["Lib.Core/v1.0.1", "Lib.Http/v1.0.1"], RemoteTags().Where(t => t.EndsWith("1.0.1", StringComparison.Ordinal)));
+        Assert.Equal(["Lib.Core/v1.0.1", "Lib.Http/v1.0.1"], gitHub.Releases);
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_TagAlreadyAtHead_IsKeptAndPushed()
+    {
+        // Given: Lib.Core/v1.0.1 was created by hand at HEAD, locally only
+        var (config, _) = Publishing();
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+        Git("tag", "-a", "Lib.Core/v1.0.1", "-m", "manual");
+        var annotated = Git("rev-parse", "Lib.Core/v1.0.1").Trim();
+
+        // When
+        var releaser = new Releaser(Repository.Open(_root), config, TextWriter.Null, null);
+        await releaser.ReleaseAsync(releaser.Plan(), Path.Combine(_root, "artifacts"), dryRun: false);
+
+        // Then: the existing tag is not replaced, and both tags reach origin at HEAD
+        Assert.Equal(annotated, Git("rev-parse", "Lib.Core/v1.0.1").Trim());
+        var head = Git("rev-parse", "HEAD").Trim();
+        var remote = ProcessRunner.Run(_root, "git", "ls-remote", "--tags", "origin");
+        Assert.Contains($"{head}\trefs/tags/Lib.Core/v1.0.1", remote);
+        Assert.Contains($"{head}\trefs/tags/Lib.Http/v1.0.1", remote);
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_GroupedMode_CreatesOneReleaseForEveryPackage()
+    {
+        // Given
+        var (config, _) = Publishing("grouped");
+        var gitHub = new FakeGitHub(_root);
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+
+        // When
+        var releaser = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        await releaser.ReleaseAsync(releaser.Plan(), Path.Combine(_root, "artifacts"), dryRun: false);
+
+        // Then: one release on HEAD, named after every package, with a section for each
+        var head = Git("rev-parse", "HEAD").Trim();
+        var (tag, target, name, body) = Assert.Single(gitHub.Created);
+        Assert.Equal($"releases/{head[..7]}", tag);
+        Assert.Equal(head, target);
+        Assert.Equal("Lib.Core 1.0.1, Lib.Http 1.0.1", name);
+        Assert.Contains("## Lib.Core 1.0.1", body);
+        Assert.Contains("## Lib.Http 1.0.1", body);
+        Assert.Contains("fix: core bug", body);
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_PushFails_DoesNotLeakTheApiKey()
+    {
+        // Given: a feed whose source is a file, so dotnet nuget push fails
+        const string key = "oy2-secret-api-key-value";
+        var (config, _) = Publishing();
+        var source = Path.Combine(_cleanup[^1], "not-a-feed.txt");
+        File.WriteAllText(source, "");
+        config.Feed = [new FeedConfig { Name = "broken", Source = source, ApiKeyEnv = "NUGET_RELEASER_TESTS_SECRET_KEY" }];
+        Environment.SetEnvironmentVariable("NUGET_RELEASER_TESTS_SECRET_KEY", key);
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+        var log = new StringWriter();
+
+        // When
+        var releaser = new Releaser(Repository.Open(_root), config, log, null);
+        var error = await Assert.ThrowsAsync<ReleaserException>(() => releaser.ReleaseAsync(releaser.Plan(), Path.Combine(_root, "artifacts"), dryRun: false));
+
+        // Then
+        Assert.Contains("dotnet nuget", error.Message);
+        Assert.DoesNotContain(key, error.Message);
+        Assert.DoesNotContain(key, log.ToString());
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_ApiKeyMissing_FailsBeforePacking()
+    {
+        // Given
+        var (config, _) = Publishing();
+        config.Feed = [new FeedConfig { Name = "nuget.org", ApiKeyEnv = "NUGET_RELEASER_TESTS_UNSET_KEY" }];
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { public class A { } }");
+        Commit("fix: core bug");
+
+        // When
+        var releaser = new Releaser(Repository.Open(_root), config, TextWriter.Null, null);
+        var error = await Assert.ThrowsAsync<ReleaserException>(() => releaser.ReleaseAsync(releaser.Plan(), Path.Combine(_root, "artifacts"), dryRun: false));
+
+        // Then
+        Assert.Contains("NUGET_RELEASER_TESTS_UNSET_KEY", error.Message);
+        Assert.False(Directory.Exists(Path.Combine(_root, "artifacts")));
+    }
+
+    /// <summary>A bare <c>origin</c> remote, and a local folder feed with GitHub Releases in <paramref name="releaseMode" />.</summary>
+    private (ReleaserConfig Config, string Feed) Publishing(string releaseMode = "per-package")
     {
         var origin = Directory.CreateTempSubdirectory("nuget-releaser-origin-").FullName;
         var feed = Directory.CreateTempSubdirectory("nuget-releaser-feed-").FullName;
@@ -275,16 +431,25 @@ public sealed class ReleaserIntegrationTests : IDisposable
         Environment.SetEnvironmentVariable("NUGET_RELEASER_TESTS_KEY", "test");
         return (new ReleaserConfig
         {
-            Github = new GitHubConfig { ReleaseMode = "per-package" },
+            Github = new GitHubConfig { ReleaseMode = releaseMode },
             Feed = [new FeedConfig { Name = "local", Source = feed, ApiKeyEnv = "NUGET_RELEASER_TESTS_KEY" }]
         }, feed);
     }
+
+    /// <summary>The tag names on <c>origin</c>, sorted.</summary>
+    private List<string> RemoteTags() =>
+        ProcessRunner.Run(_root, "git", "ls-remote", "--tags", "--refs", "origin")
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line[(line.IndexOf("refs/tags/", StringComparison.Ordinal) + "refs/tags/".Length)..].Trim())
+            .Order(StringComparer.Ordinal).ToList();
 
     /// <summary>The GitHub Releases REST endpoints used by <see cref="GitHubReleases" />, in memory.</summary>
     private sealed class FakeGitHub(string repository) : HttpMessageHandler
     {
         public List<string> Releases { get; } = [];
+        public List<(string Tag, string Target, string Name, string Body)> Created { get; } = [];
         public List<bool> TagOnRemoteWhenCreated { get; } = [];
+        public int Posts { get; private set; }
         public string? FailOn { get; set; }
 
         public GitHubReleases Client() => new(new HttpClient(this, disposeHandler: false) { BaseAddress = new Uri("https://api.github.test/") }, "o/r");
@@ -299,6 +464,7 @@ public sealed class ReleaserIntegrationTests : IDisposable
                 return new HttpResponseMessage(Releases.Contains(tag) ? System.Net.HttpStatusCode.OK : System.Net.HttpStatusCode.NotFound);
             }
 
+            Posts++;
             using var body = System.Text.Json.JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
             var created = body.RootElement.GetProperty("tag_name").GetString()!;
             if (created == FailOn)
@@ -308,6 +474,8 @@ public sealed class ReleaserIntegrationTests : IDisposable
 
             TagOnRemoteWhenCreated.Add(ProcessRunner.Run(repository, "git", "ls-remote", "--tags", "origin").Contains($"refs/tags/{created}"));
             Releases.Add(created);
+            Created.Add((created, body.RootElement.GetProperty("target_commitish").GetString()!,
+                body.RootElement.GetProperty("name").GetString()!, body.RootElement.GetProperty("body").GetString()!));
             return new HttpResponseMessage(System.Net.HttpStatusCode.Created);
         }
     }
