@@ -72,7 +72,7 @@ internal sealed class Repository
                 .Where(path => tracked.Contains(path) && !path.StartsWith(directory + "/", StringComparison.Ordinal));
             List<string> paths = [directory, .. extraPaths, .. config.Defaults.SharedPaths, .. imports];
             return new PackageInfo(project.PackageId, Relative(project.FullPath), [.. dependencies.Distinct()],
-                [.. paths.Distinct(StringComparer.Ordinal)], LocatedImports(directory));
+                [.. paths.Distinct(StringComparer.Ordinal)], LocatedImports(directory, tracked));
         }).ToList();
     }
 
@@ -121,17 +121,27 @@ internal sealed class Repository
             .ToList();
 
     /// <summary>
-    ///     The files MSBuild would import by location for a project in <paramref name="directory" />: each
-    ///     <c>Directory.Build.props</c>, <c>Directory.Build.targets</c> and <c>Directory.Packages.props</c> above it, up
-    ///     to the repository root. Present ones are already among its imports; this list is for the deleted ones.
+    ///     Where a deleted file would have been imported by location for a project in <paramref name="directory" />.
+    ///     MSBuild imports the nearest <c>Directory.Build.props</c>, <c>Directory.Build.targets</c> and
+    ///     <c>Directory.Packages.props</c> from the project directory up, and stops there: for each name, the directories up to the nearest
+    ///     tracked one (itself among the imports). A deleted file above it was shadowed, unless the nearest one imported it:
+    ///     then removing that import edits the nearest one, which is watched.
     /// </summary>
-    private static List<string> LocatedImports(string directory)
+    private static List<string> LocatedImports(string directory, HashSet<string> tracked)
     {
         var located = new List<string>();
-        for (var parent = Path.GetDirectoryName(directory); parent is not null; parent = Path.GetDirectoryName(parent))
+        foreach (var name in (string[])["Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props"])
         {
-            var prefix = parent.Length == 0 ? "" : parent.Replace('\\', '/') + "/";
-            located.AddRange([$"{prefix}Directory.Build.props", $"{prefix}Directory.Build.targets", $"{prefix}Directory.Packages.props"]);
+            for (string? parent = directory == "." ? "" : directory; parent is not null; parent = Path.GetDirectoryName(parent))
+            {
+                var path = (parent.Length == 0 ? "" : parent.Replace('\\', '/') + "/") + name;
+                if (tracked.Contains(path))
+                {
+                    break;
+                }
+
+                located.Add(path);
+            }
         }
 
         return located;

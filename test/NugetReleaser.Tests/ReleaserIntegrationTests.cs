@@ -123,6 +123,23 @@ public sealed class ReleaserIntegrationTests : IDisposable
     }
 
     [Fact]
+    public void Plan_ShadowedDirectoryBuildPropsDeleted_ReleasesOnlyThePackagesThatImportedIt()
+    {
+        // Given: src/Lib.Core has its own Directory.Build.props, so it never imported src/Directory.Build.props
+        File.WriteAllText(Path.Combine(_root, "src/Directory.Build.props"), "<Project />");
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/Directory.Build.props"), "<Project />");
+        CommitAndTagAll("build: settings", "1.0.1");
+        File.Delete(Path.Combine(_root, "src/Directory.Build.props"));
+        Commit("fix: drop shared settings");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then
+        Assert.Equal(["Lib", "Lib.Http"], plan.Releases.Select(p => p.Id).Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
     public void Plan_FileImportedByOneProject_ReleasesOnlyThatPackage()
     {
         // Given: only Lib imports build/lib.targets
