@@ -81,14 +81,16 @@ internal sealed class Repository
             // "XY path"; a rename or copy is followed by its original path as an extra entry.
             var status = entries[i][..2];
             var path = entries[i][3..];
-            if (status.Contains('R') || status.Contains('C'))
-            {
-                i++;
-            }
+            var original = status.Contains('R') || status.Contains('C') ? entries[++i] : null;
 
+            // A file moved into the excluded directory is still a change: HEAD has it where it was.
             if (!path.StartsWith(excluded, StringComparison.Ordinal))
             {
                 changes.Add(path);
+            }
+            else if (original is not null && !original.StartsWith(excluded, StringComparison.Ordinal))
+            {
+                changes.Add(original);
             }
         }
 
