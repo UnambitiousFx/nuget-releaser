@@ -169,6 +169,26 @@ public sealed class ReleaserIntegrationTests : IDisposable
     }
 
     [Fact]
+    public void UncommittedChanges_NonAsciiPaths_AreReportedVerbatimAndOutputIsExcluded()
+    {
+        // Given: an output directory with a non-ASCII name holding a file, an untracked non-ASCII file,
+        // and a staged rename (two NUL-separated paths with -z)
+        File.WriteAllText(Path.Combine(_root, "src/Lib.Core/A.cs"), "namespace Lib.Core { }");
+        Commit("chore: add a");
+        Git("mv", "src/Lib.Core/A.cs", "src/Lib.Core/Ä.cs");
+        File.WriteAllText(Path.Combine(_root, "src/Lib/Café.cs"), "namespace Lib { }");
+        var output = Path.Combine(_root, "artifacts", "é");
+        Directory.CreateDirectory(output);
+        File.WriteAllText(Path.Combine(output, "Lib.1.0.0.nupkg"), "x");
+
+        // When
+        var changes = Repository.Open(_root).UncommittedChanges(output);
+
+        // Then
+        Assert.Equal(["src/Lib.Core/Ä.cs", "src/Lib/Café.cs"], changes);
+    }
+
+    [Fact]
     public async Task ReleaseAsync_SecondGitHubReleaseFailsThenRerun_FinishesTheRelease()
     {
         // Given: an origin remote, a local folder feed, per-package GitHub Releases, and a GitHub that fails on the second one

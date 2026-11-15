@@ -67,15 +67,32 @@ internal sealed class Repository
     public IReadOnlyList<string> Tags() =>
         Git(Root, "tag", "--list", "--merged", "HEAD").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
-    /// <summary>Tracked or untracked (not ignored) changes outside <paramref name="excludedDirectory" />.</summary>
+    /// <summary>
+    ///     Tracked or untracked (not ignored) changes outside <paramref name="excludedDirectory" />. Read with <c>-z</c>:
+    ///     otherwise git quotes and octal-escapes non-ASCII paths (<c>core.quotePath</c>).
+    /// </summary>
     public IReadOnlyList<string> UncommittedChanges(string excludedDirectory)
     {
         var excluded = Relative(Path.GetFullPath(excludedDirectory)) + "/";
-        return Git(Root, "status", "--porcelain", "--untracked-files=all")
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            .Select(line => line[3..].Trim('"'))
-            .Where(path => !path.StartsWith(excluded, StringComparison.Ordinal))
-            .ToList();
+        var entries = Git(Root, "status", "--porcelain", "-z", "--untracked-files=all").Split('\0', StringSplitOptions.RemoveEmptyEntries);
+        var changes = new List<string>();
+        for (var i = 0; i < entries.Length; i++)
+        {
+            // "XY path"; a rename or copy is followed by its original path as an extra entry.
+            var status = entries[i][..2];
+            var path = entries[i][3..];
+            if (status.Contains('R') || status.Contains('C'))
+            {
+                i++;
+            }
+
+            if (!path.StartsWith(excluded, StringComparison.Ordinal))
+            {
+                changes.Add(path);
+            }
+        }
+
+        return changes;
     }
 
     /// <summary>Commits reachable from HEAD but not from <paramref name="since" /> that touch one of <paramref name="paths" />.</summary>
