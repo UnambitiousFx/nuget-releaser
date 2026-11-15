@@ -639,6 +639,140 @@ public sealed class ReleaserIntegrationTests : IDisposable
         Assert.False(Directory.Exists(Path.Combine(_root, "artifacts")));
     }
 
+    [Fact]
+    public void Plan_TagFormatWithoutPackageAndSeveralPackages_Throws()
+    {
+        // Given
+        var config = new ReleaserConfig { Defaults = new DefaultsConfig { TagFormat = "v{version}" } };
+
+        // When
+        var error = Assert.Throws<ReleaserException>(() => new Releaser(Repository.Open(_root), config, TextWriter.Null, null).Plan());
+
+        // Then
+        Assert.Contains("{package}", error.Message);
+        Assert.Contains("Lib, Lib.Core, Lib.Http", error.Message);
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_SinglePackageWithPlainVersionTags_TagsAndAttachesAssets()
+    {
+        // Given: Lib is the only package, tagged v1.0.0, released to no feed, as nuget-releaser releases itself
+        var (config, _) = SinglePackage();
+        var gitHub = new FakeGitHub(_root);
+        var dist = Dist("nuget-releaser-linux-x64.tar.gz", "checksums.txt");
+        File.WriteAllText(Path.Combine(_root, "src/Lib/A.cs"), "namespace Lib { public class A { } }");
+        Commit("fix: lib bug");
+        var log = new StringWriter();
+
+        // When
+        var releaser = new Releaser(Repository.Open(_root), config, log, gitHub.Client());
+        await releaser.ReleaseAsync(releaser.Plan(), Path.Combine(_root, "artifacts"), dryRun: false, [Path.Combine(dist, "*")]);
+
+        // Then
+        Assert.Contains("v1.0.1", RemoteTags());
+        var (tag, _, name, _) = Assert.Single(gitHub.Created);
+        Assert.Equal("v1.0.1", tag);
+        Assert.Equal("Lib 1.0.1", name);
+        Assert.Equal(["checksums.txt", "nuget-releaser-linux-x64.tar.gz"], gitHub.Assets["v1.0.1"]);
+        Assert.Contains("No feed configured", log.ToString());
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_AssetUploadFailsThenRerun_AttachesTheMissingAsset()
+    {
+        // Given: the first run uploads the archive, then fails on checksums.txt
+        var (config, _) = SinglePackage();
+        var gitHub = new FakeGitHub(_root) { FailUploadOf = "checksums.txt" };
+        string[] assets = [Path.Combine(Dist("checksums.txt", "nuget-releaser-linux-x64.tar.gz"), "*")];
+        File.WriteAllText(Path.Combine(_root, "src/Lib/A.cs"), "namespace Lib { public class A { } }");
+        Commit("fix: lib bug");
+        var output = Path.Combine(_root, "artifacts");
+        var first = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        await Assert.ThrowsAsync<ReleaserException>(() => first.ReleaseAsync(first.Plan(), output, dryRun: false, assets));
+
+        // When: the release is run again
+        gitHub.FailUploadOf = null;
+        var second = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        await second.ReleaseAsync(second.Plan(), output, dryRun: false, assets);
+
+        // Then: the existing release gets the asset it was missing, once
+        Assert.Equal(["v1.0.1"], gitHub.Releases);
+        Assert.Equal(["checksums.txt", "nuget-releaser-linux-x64.tar.gz"], gitHub.Assets["v1.0.1"].Order(StringComparer.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("missing/*.zip", true)]
+    [InlineData("missing.zip", true)]
+    [InlineData("dist/*", false)]
+    public async Task ReleaseAsync_AssetUnusable_FailsBeforePublishing(string asset, bool withGitHub)
+    {
+        // Given: an asset that matches nothing, or assets without GitHub Releases to attach them to
+        var (config, _) = SinglePackage();
+        var gitHub = new FakeGitHub(_root);
+        var dist = Dist("a.zip");
+        File.WriteAllText(Path.Combine(_root, "src/Lib/A.cs"), "namespace Lib { public class A { } }");
+        Commit("fix: lib bug");
+
+        // When
+        var releaser = new Releaser(Repository.Open(_root), config, TextWriter.Null, withGitHub ? gitHub.Client() : null);
+        var error = await Assert.ThrowsAsync<ReleaserException>(() =>
+            releaser.ReleaseAsync(releaser.Plan(), Path.Combine(_root, "artifacts"), dryRun: false, [Path.Combine(Path.GetDirectoryName(dist)!, asset)]));
+
+        // Then: nothing was packed, tagged or released
+        Assert.Contains("--asset", error.Message);
+        Assert.False(Directory.Exists(Path.Combine(_root, "artifacts")));
+        Assert.DoesNotContain("v1.0.1", RemoteTags());
+        Assert.Empty(gitHub.Releases);
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_TwoAssetsWithTheSameName_Throws()
+    {
+        // Given
+        var (config, _) = SinglePackage();
+        var first = Dist("a.zip");
+        var second = Dist("a.zip");
+        File.WriteAllText(Path.Combine(_root, "src/Lib/A.cs"), "namespace Lib { public class A { } }");
+        Commit("fix: lib bug");
+
+        // When
+        var releaser = new Releaser(Repository.Open(_root), config, TextWriter.Null, new FakeGitHub(_root).Client());
+        var error = await Assert.ThrowsAsync<ReleaserException>(() => releaser.ReleaseAsync(releaser.Plan(), Path.Combine(_root, "artifacts"),
+            dryRun: false, [Path.Combine(first, "a.zip"), Path.Combine(second, "*.zip")]));
+
+        // Then
+        Assert.Contains("a.zip more than once", error.Message);
+    }
+
+    /// <summary>
+    ///     Lib alone is packable, tagged <c>v1.0.0</c> with <c>tag_format = "v{version}"</c>, released to no feed with
+    ///     per-package GitHub Releases: how nuget-releaser releases itself.
+    /// </summary>
+    private (ReleaserConfig Config, string Origin) SinglePackage()
+    {
+        Project("src/Lib.Core/Lib.Core.csproj", "<PropertyGroup><IsPackable>false</IsPackable></PropertyGroup>");
+        Project("src/Lib.Http/Lib.Http.csproj", """<PropertyGroup><IsPackable>false</IsPackable></PropertyGroup><ItemGroup><ProjectReference Include="../Lib.Core/Lib.Core.csproj" /></ItemGroup>""");
+        Commit("chore: one package");
+        Git("tag", "v1.0.0");
+        var (config, _) = Publishing();
+        config.Defaults.TagFormat = "v{version}";
+        config.Feed = [];
+        return (config, Git("remote", "get-url", "origin").Trim());
+    }
+
+    /// <summary>A new directory outside the repository holding empty files named <paramref name="names" />.</summary>
+    private string Dist(params string[] names)
+    {
+        var dist = Directory.CreateTempSubdirectory("nuget-releaser-dist-").FullName;
+        _cleanup.Add(dist);
+        foreach (var name in names)
+        {
+            File.WriteAllText(Path.Combine(dist, name), name);
+        }
+
+        return dist;
+    }
+
     /// <summary>A bare <c>origin</c> remote, and a local folder feed with GitHub Releases in <paramref name="releaseMode" />.</summary>
     private (ReleaserConfig Config, string Feed) Publishing(string releaseMode = "per-package")
     {
@@ -671,16 +805,54 @@ public sealed class ReleaserIntegrationTests : IDisposable
         public int Posts { get; private set; }
         public string? FailOn { get; set; }
 
+        /// <summary>Asset names per release tag, in upload order.</summary>
+        public Dictionary<string, List<string>> Assets { get; } = [];
+
+        /// <summary>An asset name whose upload fails.</summary>
+        public string? FailUploadOf { get; set; }
+
         public GitHubReleases Client() => new(new HttpClient(this, disposeHandler: false) { BaseAddress = new Uri("https://api.github.test/") }, "o/r");
+
+        /// <summary>A release's id is its position in <see cref="Releases" />.</summary>
+        private static HttpResponseMessage Release(System.Net.HttpStatusCode status, int id, string tag) => new(status)
+        {
+            Content = new StringContent($$"""{"id":{{id}},"tag_name":"{{tag}}","upload_url":"https://uploads.github.test/repos/o/r/releases/{{id}}/assets{?name,label}"}""")
+        };
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             const string byTag = "/releases/tags/";
-            var path = request.RequestUri!.AbsolutePath;
+            var uri = request.RequestUri!;
+            var path = uri.AbsolutePath;
+            // .../releases/{id}/assets, listed on api.github.test and uploaded to uploads.github.test
+            if (path.EndsWith("/assets", StringComparison.Ordinal))
+            {
+                var tag = Releases[int.Parse(path.Split('/')[^2], System.Globalization.CultureInfo.InvariantCulture)];
+                var assets = Assets.TryGetValue(tag, out var list) ? list : Assets[tag] = [];
+                if (request.Method == HttpMethod.Get)
+                {
+                    return new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("[" + string.Join(",", assets.Select(a => $$"""{"name":"{{a}}"}""")) + "]")
+                    };
+                }
+
+                var name = Uri.UnescapeDataString(uri.Query["?name=".Length..]);
+                if (name == FailUploadOf)
+                {
+                    return new HttpResponseMessage(System.Net.HttpStatusCode.BadGateway) { Content = new StringContent("") };
+                }
+
+                assets.Add(name);
+                return new HttpResponseMessage(System.Net.HttpStatusCode.Created) { Content = new StringContent("{}") };
+            }
+
             if (request.Method == HttpMethod.Get)
             {
                 var tag = Uri.UnescapeDataString(path[(path.IndexOf(byTag, StringComparison.Ordinal) + byTag.Length)..]);
-                return new HttpResponseMessage(Releases.Contains(tag) ? System.Net.HttpStatusCode.OK : System.Net.HttpStatusCode.NotFound);
+                return Releases.IndexOf(tag) is var id and >= 0
+                    ? Release(System.Net.HttpStatusCode.OK, id, tag)
+                    : new HttpResponseMessage(System.Net.HttpStatusCode.NotFound);
             }
 
             Posts++;
@@ -695,7 +867,7 @@ public sealed class ReleaserIntegrationTests : IDisposable
             Releases.Add(created);
             Created.Add((created, body.RootElement.GetProperty("target_commitish").GetString()!,
                 body.RootElement.GetProperty("name").GetString()!, body.RootElement.GetProperty("body").GetString()!));
-            return new HttpResponseMessage(System.Net.HttpStatusCode.Created);
+            return Release(System.Net.HttpStatusCode.Created, Releases.Count - 1, created);
         }
     }
 

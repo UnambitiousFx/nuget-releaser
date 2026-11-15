@@ -1,6 +1,6 @@
 name: PR title
 
-# Squash merges use the PR title as the commit message, and semantic-release derives the version from it.
+# Squash merges use the PR title as the commit message, and nuget-releaser derives the version from it.
 on:
   pull_request_target:
     types: [opened, edited, reopened, synchronize]

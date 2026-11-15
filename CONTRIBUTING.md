@@ -82,14 +82,17 @@ dotnet publish src/NugetReleaser -c Release -r <rid> -p:PublishAot=true
 
 (For maintainers)
 
-Releases are automatic. Every push to `main` that passes CI runs [semantic-release](https://semantic-release.gitbook.io/)
-(`.github/workflows/release.yml`):
+Releases are automatic, and made by nuget-releaser itself (`.github/workflows/release.yml`, `nuget-releaser.toml`).
+Every push to `main` that passes CI plans the next version:
 
 - `feat:` → minor, `fix:`/`perf:` → patch, `!` or a `BREAKING CHANGE:` footer → major; other types don't release.
+- Only commits that touch the tool count: `src/NugetReleaser`, the build files it imports and the `shared_paths`.
+  A `fix:` that changes only the tests, the docs or the workflows releases nothing.
 - Native AOT binaries are built for `linux`, `osx` and `win`, each in `x64` and `arm64` (`.github/workflows/binaries.yml`);
-  only once all six are built are the `vX.Y.Z` tag and the GitHub release created, with the archives and their
-  `checksums.txt` attached.
-- Nothing is published to NuGet for now.
+  only once all six are built does the freshly built `linux-x64` binary run `nuget-releaser release`, which tags
+  `vX.Y.Z` and creates the GitHub release with the archives and their `checksums.txt` attached.
+- A failed release job is fixed by re-running it: the tag and the release are kept, missing assets are uploaded.
+- Nothing is published to NuGet for now (`feed = []`).
 
 While the repository is private, the release job is skipped.
 
