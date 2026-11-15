@@ -140,6 +140,24 @@ public sealed class ReleaserIntegrationTests : IDisposable
     }
 
     [Fact]
+    public void Plan_DirectoryBuildPropsDeletedThenNearerOneAdded_ReleasesTheFix()
+    {
+        // Given: Lib imported src/Directory.Build.props when it was deleted; only later did Lib get its own
+        File.WriteAllText(Path.Combine(_root, "src/Directory.Build.props"), "<Project />");
+        CommitAndTagAll("build: settings", "1.0.1");
+        File.Delete(Path.Combine(_root, "src/Directory.Build.props"));
+        Commit("fix: drop shared settings");
+        File.WriteAllText(Path.Combine(_root, "src/Lib/Directory.Build.props"), "<Project />");
+        Commit("chore: lib settings");
+
+        // When
+        var lib = Releaser().Plan().Packages.Single(p => p.Id == "Lib");
+
+        // Then: the layout at HEAD does not hide a deletion that happened before it
+        Assert.Equal("1.0.2", lib.NextVersion);
+    }
+
+    [Fact]
     public void Plan_FileImportedByOneProject_ReleasesOnlyThatPackage()
     {
         // Given: only Lib imports build/lib.targets

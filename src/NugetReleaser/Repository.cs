@@ -72,7 +72,7 @@ internal sealed class Repository
                 .Where(path => tracked.Contains(path) && !path.StartsWith(directory + "/", StringComparison.Ordinal));
             List<string> paths = [directory, .. extraPaths, .. config.Defaults.SharedPaths, .. imports];
             return new PackageInfo(project.PackageId, Relative(project.FullPath), [.. dependencies.Distinct()],
-                [.. paths.Distinct(StringComparer.Ordinal)], LocatedImports(directory, tracked));
+                [.. paths.Distinct(StringComparer.Ordinal)], LocatedImports(directory));
         }).ToList();
     }
 
@@ -98,11 +98,7 @@ internal sealed class Repository
     public IReadOnlyList<Commit> CommitsSince(string? since, IReadOnlyList<string> paths, IReadOnlyList<string> deletedPaths)
     {
         var range = since is null ? "HEAD" : $"{since}..HEAD";
-        var deletions = deletedPaths.Count == 0
-            ? []
-            : Git(Root, ["log", "--format=%H", "--diff-filter=D", range, "--", .. deletedPaths])
-                .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .ToHashSet(StringComparer.Ordinal);
+        var deletions = deletedPaths.Count == 0 ? [] : DeletionsOfImported(range, deletedPaths);
         if (deletions.Count == 0)
         {
             return Log(range, paths);
@@ -121,26 +117,48 @@ internal sealed class Repository
             .ToList();
 
     /// <summary>
-    ///     Where a deleted file would have been imported by location for a project in <paramref name="directory" />.
-    ///     MSBuild imports the nearest <c>Directory.Build.props</c>, <c>Directory.Build.targets</c> and
-    ///     <c>Directory.Packages.props</c> from the project directory up, and stops there: for each name, the directories up to the nearest
-    ///     tracked one (itself among the imports). A deleted file above it was shadowed, unless the nearest one imported it:
-    ///     then removing that import edits the nearest one, which is watched.
+    ///     The commits in <paramref name="range" /> deleting a <paramref name="located" /> file that the project imported
+    ///     right before: no file of the same name nearer the project existed in the commit's parent. The layout at HEAD
+    ///     says nothing about it, files can be added or removed in between.
     /// </summary>
-    private static List<string> LocatedImports(string directory, HashSet<string> tracked)
+    private HashSet<string> DeletionsOfImported(string range, IReadOnlyList<string> located)
+    {
+        var deletions = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in Git(Root, ["log", "--format=%x1e%H", "--name-only", "--diff-filter=D", range, "--", .. located])
+                     .Split('\x1e', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var lines = entry.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var nearer = lines.Skip(1).SelectMany(deleted => located.TakeWhile(p => p != deleted).Where(p => SameName(p, deleted))).ToList();
+            var existing = nearer.Count == 0
+                ? []
+                : Git(Root, ["ls-tree", "--name-only", $"{lines[0]}^", "--", .. nearer])
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .ToHashSet(StringComparer.Ordinal);
+            if (lines.Skip(1).Any(deleted => !located.TakeWhile(p => p != deleted).Any(p => SameName(p, deleted) && existing.Contains(p))))
+            {
+                deletions.Add(lines[0]);
+            }
+        }
+
+        return deletions;
+
+        static bool SameName(string a, string b) => string.Equals(Path.GetFileName(a), Path.GetFileName(b), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    ///     Where MSBuild looks for the files it imports by location, for a project in <paramref name="directory" />: each
+    ///     <c>Directory.Build.props</c>, <c>Directory.Build.targets</c> and <c>Directory.Packages.props</c> from the project
+    ///     directory up to the repository root, nearest first. It imports the nearest one of each name and stops there;
+    ///     a farther one is reached only through an <c>Import</c> in a nearer one, which is watched as an import.
+    /// </summary>
+    private static List<string> LocatedImports(string directory)
     {
         var located = new List<string>();
         foreach (var name in (string[])["Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props"])
         {
             for (string? parent = directory == "." ? "" : directory; parent is not null; parent = Path.GetDirectoryName(parent))
             {
-                var path = (parent.Length == 0 ? "" : parent.Replace('\\', '/') + "/") + name;
-                if (tracked.Contains(path))
-                {
-                    break;
-                }
-
-                located.Add(path);
+                located.Add((parent.Length == 0 ? "" : parent.Replace('\\', '/') + "/") + name);
             }
         }
 
