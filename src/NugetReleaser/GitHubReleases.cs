@@ -72,14 +72,7 @@ internal sealed partial class GitHubReleases(HttpClient http, string repository)
             return [];
         }
 
-        using var listed = await http.GetAsync($"repos/{repository}/releases/{release.Id}/assets?per_page=100");
-        if (!listed.IsSuccessStatusCode)
-        {
-            throw new ReleaserException($"GitHub: listing the assets of release {release.TagName} failed ({(int)listed.StatusCode}).");
-        }
-
-        var existing = (await listed.Content.ReadFromJsonAsync(GitHubJsonContext.Default.ListGitHubAsset) ?? [])
-            .Select(a => a.Name).ToHashSet(StringComparer.Ordinal);
+        var existing = await ExistingAssetsAsync(release);
 
         // upload_url is a URI template: "https://uploads.github.com/repos/o/r/releases/1/assets{?name,label}".
         var uploadUrl = release.UploadUrl.Split('{')[0];
@@ -105,6 +98,28 @@ internal sealed partial class GitHubReleases(HttpClient http, string repository)
         }
 
         return uploaded;
+    }
+
+    /// <summary>Every asset name of the release, page by page: a name missed on a later page would be uploaded again and rejected.</summary>
+    private async Task<HashSet<string>> ExistingAssetsAsync(GitHubRelease release)
+    {
+        const int pageSize = 100;
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        for (var page = 1; ; page++)
+        {
+            using var listed = await http.GetAsync($"repos/{repository}/releases/{release.Id}/assets?per_page={pageSize}&page={page}");
+            if (!listed.IsSuccessStatusCode)
+            {
+                throw new ReleaserException($"GitHub: listing the assets of release {release.TagName} failed ({(int)listed.StatusCode}).");
+            }
+
+            var assets = await listed.Content.ReadFromJsonAsync(GitHubJsonContext.Default.ListGitHubAsset) ?? [];
+            names.UnionWith(assets.Select(a => a.Name));
+            if (assets.Count < pageSize)
+            {
+                return names;
+            }
+        }
     }
 
     private static async Task<GitHubRelease> ReadReleaseAsync(HttpResponseMessage response, string tag) =>

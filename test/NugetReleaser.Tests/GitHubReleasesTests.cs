@@ -138,6 +138,23 @@ public sealed class GitHubReleasesTests : IDisposable
         Assert.Equal(["checksums.txt"], handler.Uploads.Select(u => u.Name));
     }
 
+    [Theory]
+    [InlineData(150)]
+    [InlineData(200)]
+    public async Task UploadAssetsAsync_AssetOnALaterPage_IsSkipped(int count)
+    {
+        // Given: a release with more assets than one page holds, the archive among the last ones
+        var existing = Enumerable.Range(0, count - 1).Select(i => $"other-{i:D3}.zip").Append("tool-linux-x64.tar.gz").ToList();
+        var handler = new StubHandler { ExistingAssets = existing };
+
+        // When
+        var uploaded = await handler.Client().UploadAssetsAsync(Release(), [Asset("tool-linux-x64.tar.gz", "x"), Asset("checksums.txt", "y")]);
+
+        // Then: every page was read, and an exact multiple of the page size ends on an empty page
+        Assert.Equal(["checksums.txt"], uploaded);
+        Assert.Equal(count / 100 + 1, handler.Gets.Count(g => g.Contains("/assets", StringComparison.Ordinal)));
+    }
+
     [Fact]
     public async Task UploadAssetsAsync_NameWithSpace_IsEscaped()
     {
@@ -221,9 +238,13 @@ public sealed class GitHubReleasesTests : IDisposable
                 Gets.Add(uri.AbsoluteUri);
                 if (uri.AbsolutePath.EndsWith("/assets", StringComparison.Ordinal))
                 {
+                    // Paged as GitHub does it: ?per_page=N&page=P, P from 1.
+                    var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
+                    var perPage = int.Parse(query["per_page"] ?? "30", System.Globalization.CultureInfo.InvariantCulture);
+                    var page = int.Parse(query["page"] ?? "1", System.Globalization.CultureInfo.InvariantCulture);
                     return new HttpResponseMessage(HttpStatusCode.OK)
                     {
-                        Content = new StringContent(JsonSerializer.Serialize(ExistingAssets.Select(n => new { name = n })))
+                        Content = new StringContent(JsonSerializer.Serialize(ExistingAssets.Skip((page - 1) * perPage).Take(perPage).Select(n => new { name = n })))
                     };
                 }
 

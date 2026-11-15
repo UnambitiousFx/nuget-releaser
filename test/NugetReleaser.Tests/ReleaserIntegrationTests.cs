@@ -640,6 +640,22 @@ public sealed class ReleaserIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task ReleaseAsync_GeneratePackageOnBuildFromCleanCheckout_Packs()
+    {
+        // Given: GeneratePackageOnBuild, as many repositories turn on in CI, and nothing built yet
+        Project("src/Lib/Lib.csproj", "<PropertyGroup><GeneratePackageOnBuild>true</GeneratePackageOnBuild></PropertyGroup>");
+        Commit("fix: package on build");
+        var output = Path.Combine(_root, "artifacts");
+
+        // When
+        var releaser = Releaser();
+        await releaser.ReleaseAsync(releaser.Plan(), output, dryRun: true);
+
+        // Then: with it, dotnet pack skips its build to avoid a build/pack cycle; the tool must still pack
+        Assert.True(File.Exists(Path.Combine(output, "Lib.1.0.1.nupkg")));
+    }
+
+    [Fact]
     public void Plan_TagFormatWithoutPackageAndSeveralPackages_Throws()
     {
         // Given
@@ -680,24 +696,28 @@ public sealed class ReleaserIntegrationTests : IDisposable
     [Fact]
     public async Task ReleaseAsync_AssetUploadFailsThenRerun_AttachesTheMissingAsset()
     {
-        // Given: the first run uploads the archive, then fails on checksums.txt
+        // Given: assets are uploaded in name order, so the first run attaches checksums.txt, then fails on the archive
         var (config, _) = SinglePackage();
-        var gitHub = new FakeGitHub(_root) { FailUploadOf = "checksums.txt" };
+        var gitHub = new FakeGitHub(_root) { FailUploadOf = "nuget-releaser-linux-x64.tar.gz" };
         string[] assets = [Path.Combine(Dist("checksums.txt", "nuget-releaser-linux-x64.tar.gz"), "*")];
         File.WriteAllText(Path.Combine(_root, "src/Lib/A.cs"), "namespace Lib { public class A { } }");
         Commit("fix: lib bug");
         var output = Path.Combine(_root, "artifacts");
         var first = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
         await Assert.ThrowsAsync<ReleaserException>(() => first.ReleaseAsync(first.Plan(), output, dryRun: false, assets));
+        Assert.Equal(["checksums.txt"], gitHub.Assets["v1.0.1"]);
 
         // When: the release is run again
         gitHub.FailUploadOf = null;
-        var second = new Releaser(Repository.Open(_root), config, TextWriter.Null, gitHub.Client());
+        var log = new StringWriter();
+        var second = new Releaser(Repository.Open(_root), config, log, gitHub.Client());
         await second.ReleaseAsync(second.Plan(), output, dryRun: false, assets);
 
-        // Then: the existing release gets the asset it was missing, once
+        // Then: the existing release gets only the asset it was missing
         Assert.Equal(["v1.0.1"], gitHub.Releases);
-        Assert.Equal(["checksums.txt", "nuget-releaser-linux-x64.tar.gz"], gitHub.Assets["v1.0.1"].Order(StringComparer.Ordinal));
+        Assert.Equal(["checksums.txt", "nuget-releaser-linux-x64.tar.gz"], gitHub.Assets["v1.0.1"]);
+        Assert.DoesNotContain("Attached checksums.txt", log.ToString());
+        Assert.Contains("Attached nuget-releaser-linux-x64.tar.gz to v1.0.1", log.ToString());
     }
 
     [Theory]

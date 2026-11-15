@@ -73,8 +73,11 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
         foreach (var release in releases)
         {
             log.WriteLine($"Packing {release.Id} {release.NextVersion}");
+            // GeneratePackageOnBuild (often turned on in CI) makes pack skip its own build to avoid a build/pack cycle,
+            // so a clean checkout would have no DLL to pack: the tool packs explicitly and turns it off.
             ProcessRunner.Run(repository.Root, "dotnet", "pack", Path.Combine(repository.Root, release.Project),
-                "--configuration", "Release", "--output", outputDirectory, $"-p:CustomBeforeMicrosoftCommonProps={versionsProps}");
+                "--configuration", "Release", "--output", outputDirectory, $"-p:CustomBeforeMicrosoftCommonProps={versionsProps}",
+                "-p:GeneratePackageOnBuild=false");
             var nupkg = Path.Combine(outputDirectory, $"{release.Id}.{release.NextVersion}.nupkg");
             if (!File.Exists(nupkg))
             {
