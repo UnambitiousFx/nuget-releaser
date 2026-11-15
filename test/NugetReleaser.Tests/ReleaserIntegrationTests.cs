@@ -158,6 +158,42 @@ public sealed class ReleaserIntegrationTests : IDisposable
     }
 
     [Fact]
+    public void Plan_ShadowedDeletionUnderNonAsciiPath_ReleasesNothing()
+    {
+        // Given: under src/é, Lib.Accent has its own Directory.Build.props, so it never imported src/é/Directory.Build.props
+        Project("src/é/Lib.Accent/Lib.Accent.csproj", "");
+        File.WriteAllText(Path.Combine(_root, "src/é/Directory.Build.props"), "<Project />");
+        File.WriteAllText(Path.Combine(_root, "src/é/Lib.Accent/Directory.Build.props"), "<Project />");
+        Commit("feat: accent");
+        Git("tag", "Lib.Accent/v1.0.0");
+        File.Delete(Path.Combine(_root, "src/é/Directory.Build.props"));
+        Commit("fix: drop shared settings");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then: git's quoting of non-ASCII paths must not hide the nearer file
+        Assert.Empty(plan.Releases);
+    }
+
+    [Fact]
+    public void Plan_FileImportedUnderNonAsciiPath_ReleasesThePackage()
+    {
+        // Given: Lib imports a file under a non-ASCII directory
+        Project("src/Lib/Lib.csproj", """<Import Project="../../build/é/lib.targets" />""");
+        BuildFile("build/é/lib.targets", "<Project />");
+        CommitAndTagAll("build: lib targets", "1.0.1");
+        BuildFile("build/é/lib.targets", """<Project><Target Name="Noop" /></Project>""");
+        Commit("fix: lib targets");
+
+        // When
+        var plan = Releaser().Plan();
+
+        // Then
+        Assert.Equal([("Lib", "1.0.2")], plan.Releases.Select(p => (p.Id, p.NextVersion)));
+    }
+
+    [Fact]
     public void Plan_FileImportedByOneProject_ReleasesOnlyThatPackage()
     {
         // Given: only Lib imports build/lib.targets

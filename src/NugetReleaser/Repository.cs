@@ -124,15 +124,17 @@ internal sealed class Repository
     private HashSet<string> DeletionsOfImported(string range, IReadOnlyList<string> located)
     {
         var deletions = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var entry in Git(Root, ["log", "--format=%x1e%H", "--name-only", "--diff-filter=D", range, "--", .. located])
+        // -z: without it git quotes and escapes non-ASCII paths, which would never match located. Each commit reads
+        // "\x1e<sha>\0\n<path>\0<path>\0".
+        foreach (var entry in Git(Root, ["log", "-z", "--format=%x1e%H", "--name-only", "--diff-filter=D", range, "--", .. located])
                      .Split('\x1e', StringSplitOptions.RemoveEmptyEntries))
         {
-            var lines = entry.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var lines = entry.Split('\0').Select(line => line.Trim('\n')).Where(line => line.Length > 0).ToList();
             var nearer = lines.Skip(1).SelectMany(deleted => located.TakeWhile(p => p != deleted).Where(p => SameName(p, deleted))).ToList();
             var existing = nearer.Count == 0
                 ? []
-                : Git(Root, ["ls-tree", "--name-only", $"{lines[0]}^", "--", .. nearer])
-                    .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                : Git(Root, ["ls-tree", "-z", "--name-only", $"{lines[0]}^", "--", .. nearer])
+                    .Split('\0', StringSplitOptions.RemoveEmptyEntries)
                     .ToHashSet(StringComparer.Ordinal);
             if (lines.Skip(1).Any(deleted => !located.TakeWhile(p => p != deleted).Any(p => SameName(p, deleted) && existing.Contains(p))))
             {
