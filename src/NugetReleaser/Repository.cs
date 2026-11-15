@@ -23,11 +23,18 @@ internal sealed class Repository
 
     public string Head => Git(Root, "rev-parse", "HEAD").Trim();
 
-    /// <summary>Every tracked project with <c>IsPackable=true</c>, read through MSBuild evaluation.</summary>
+    /// <summary>
+    ///     Every tracked project with <c>IsPackable=true</c>, read through MSBuild evaluation. A package's paths are its
+    ///     directory, its <c>extra_paths</c>, the <c>shared_paths</c>, and every tracked file MSBuild imports for it.
+    /// </summary>
     public IReadOnlyList<PackageInfo> DiscoverPackages(ReleaserConfig config)
     {
-        var projects = Git(Root, "ls-files", "-z", "--", "*.csproj")
+        var tracked = Git(Root, "ls-files", "-z")
             .Split('\0', StringSplitOptions.RemoveEmptyEntries)
+            .ToHashSet(StringComparer.Ordinal);
+        var projects = tracked
+            .Where(p => p.EndsWith(".csproj", StringComparison.Ordinal))
+            .Order(StringComparer.Ordinal)
             .Select(p => Path.GetFullPath(Path.Combine(Root, p)))
             .ToList();
 
@@ -58,8 +65,14 @@ internal sealed class Repository
                     : throw new ReleaserException($"{project.PackageId} references {Relative(reference)}, which is not packable: it could not be restored from the feed."));
 
             var extraPaths = overrides.TryGetValue(project.FullPath, out var o) ? o.ExtraPaths : [];
-            List<string> paths = [Relative(Path.GetDirectoryName(project.FullPath)!), .. extraPaths, .. config.Defaults.SharedPaths];
-            return new PackageInfo(project.PackageId, Relative(project.FullPath), [.. dependencies.Distinct()], paths);
+            var directory = Relative(Path.GetDirectoryName(project.FullPath)!);
+            // Inside the repository and tracked: SDK files, and what restore writes to obj/, never change in a commit.
+            var imports = project.Imports
+                .Select(Relative)
+                .Where(path => tracked.Contains(path) && !path.StartsWith(directory + "/", StringComparison.Ordinal));
+            List<string> paths = [directory, .. extraPaths, .. config.Defaults.SharedPaths, .. imports];
+            return new PackageInfo(project.PackageId, Relative(project.FullPath), [.. dependencies.Distinct()],
+                [.. paths.Distinct(StringComparer.Ordinal)], LocatedImports(directory));
         }).ToList();
     }
 
@@ -97,13 +110,81 @@ internal sealed class Repository
         return changes;
     }
 
-    /// <summary>Commits reachable from HEAD but not from <paramref name="since" /> that touch one of <paramref name="paths" />.</summary>
-    public IReadOnlyList<Commit> CommitsSince(string? since, IEnumerable<string> paths) =>
-        Git(Root, ["log", "--format=%H%x1f%B%x1e", since is null ? "HEAD" : $"{since}..HEAD", "--", .. paths])
+    /// <summary>
+    ///     Commits reachable from HEAD but not from <paramref name="since" /> that touch one of <paramref name="paths" />
+    ///     or delete one of <paramref name="deletedPaths" />, newest first.
+    /// </summary>
+    public IReadOnlyList<Commit> CommitsSince(string? since, IReadOnlyList<string> paths, IReadOnlyList<string> deletedPaths)
+    {
+        var range = since is null ? "HEAD" : $"{since}..HEAD";
+        var deletions = deletedPaths.Count == 0 ? [] : DeletionsOfImported(range, deletedPaths);
+        if (deletions.Count == 0)
+        {
+            return Log(range, paths);
+        }
+
+        // One log over both, filtered, keeps history order; a change to a file that was not deleted stays out.
+        var touching = Log(range, paths).Select(c => c.Sha).ToHashSet(StringComparer.Ordinal);
+        return Log(range, [.. paths, .. deletedPaths]).Where(c => touching.Contains(c.Sha) || deletions.Contains(c.Sha)).ToList();
+    }
+
+    private List<Commit> Log(string range, IReadOnlyList<string> paths) =>
+        Git(Root, ["log", "--format=%H%x1f%B%x1e", range, "--", .. paths])
             .Split('\x1e', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(entry => entry.Split('\x1f', 2))
             .Select(parts => new Commit(parts[0], parts[1].Trim()))
             .ToList();
+
+    /// <summary>
+    ///     The commits in <paramref name="range" /> deleting a <paramref name="located" /> file that the project imported
+    ///     right before: no file of the same name nearer the project existed in the commit's parent. The layout at HEAD
+    ///     says nothing about it, files can be added or removed in between.
+    /// </summary>
+    private HashSet<string> DeletionsOfImported(string range, IReadOnlyList<string> located)
+    {
+        var deletions = new HashSet<string>(StringComparer.Ordinal);
+        // -z: without it git quotes and escapes non-ASCII paths, which would never match located. Each commit reads
+        // "\x1e<sha>\0\n<path>\0<path>\0".
+        foreach (var entry in Git(Root, ["log", "-z", "--format=%x1e%H", "--name-only", "--diff-filter=D", range, "--", .. located])
+                     .Split('\x1e', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var lines = entry.Split('\0').Select(line => line.Trim('\n')).Where(line => line.Length > 0).ToList();
+            var nearer = lines.Skip(1).SelectMany(deleted => located.TakeWhile(p => p != deleted).Where(p => SameName(p, deleted))).ToList();
+            var existing = nearer.Count == 0
+                ? []
+                : Git(Root, ["ls-tree", "-z", "--name-only", $"{lines[0]}^", "--", .. nearer])
+                    .Split('\0', StringSplitOptions.RemoveEmptyEntries)
+                    .ToHashSet(StringComparer.Ordinal);
+            if (lines.Skip(1).Any(deleted => !located.TakeWhile(p => p != deleted).Any(p => SameName(p, deleted) && existing.Contains(p))))
+            {
+                deletions.Add(lines[0]);
+            }
+        }
+
+        return deletions;
+
+        static bool SameName(string a, string b) => string.Equals(Path.GetFileName(a), Path.GetFileName(b), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    ///     Where MSBuild looks for the files it imports by location, for a project in <paramref name="directory" />: each
+    ///     <c>Directory.Build.props</c>, <c>Directory.Build.targets</c> and <c>Directory.Packages.props</c> from the project
+    ///     directory up to the repository root, nearest first. It imports the nearest one of each name and stops there;
+    ///     a farther one is reached only through an <c>Import</c> in a nearer one, which is watched as an import.
+    /// </summary>
+    private static List<string> LocatedImports(string directory)
+    {
+        var located = new List<string>();
+        foreach (var name in (string[])["Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props"])
+        {
+            for (string? parent = directory == "." ? "" : directory; parent is not null; parent = Path.GetDirectoryName(parent))
+            {
+                located.Add((parent.Length == 0 ? "" : parent.Replace('\\', '/') + "/") + name);
+            }
+        }
+
+        return located;
+    }
 
     public bool TagExists(string tag) =>
         Git(Root, "tag", "--list", tag).Trim().Length > 0;
@@ -142,13 +223,20 @@ internal sealed class Repository
 
     /// <summary>
     ///     Evaluated as <c>dotnet pack</c> sees it: Release, and once per target framework, since a
-    ///     <c>ProjectReference</c> conditioned on <c>$(TargetFramework)</c> is invisible to the outer build.
+    ///     <c>ProjectReference</c> or an <c>Import</c> conditioned on <c>$(TargetFramework)</c> is invisible to the outer build.
+    ///     Imports are read only for a packable project: they are what makes a change release it.
     /// </summary>
     private EvaluatedProject Evaluate(string fullPath)
     {
         using var document = MsBuild(fullPath, null, "-getProperty:IsPackable", "-getProperty:PackageId", "-getProperty:TargetFrameworks");
         var properties = document.RootElement.GetProperty("Properties");
+        var isPackable = string.Equals(properties.GetProperty("IsPackable").GetString(), "true", StringComparison.OrdinalIgnoreCase);
         var references = References(document);
+        var imports = new HashSet<string>(StringComparer.Ordinal);
+        if (isPackable)
+        {
+            imports.UnionWith(Imports(fullPath, null));
+        }
 
         var targetFrameworks = properties.GetProperty("TargetFrameworks").GetString()!
             .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -156,29 +244,47 @@ internal sealed class Repository
         {
             using var inner = MsBuild(fullPath, targetFramework);
             references.UnionWith(References(inner));
+            if (isPackable)
+            {
+                imports.UnionWith(Imports(fullPath, targetFramework));
+            }
         }
 
         return new EvaluatedProject(
             fullPath,
             properties.GetProperty("PackageId").GetString()!,
-            string.Equals(properties.GetProperty("IsPackable").GetString(), "true", StringComparison.OrdinalIgnoreCase),
-            [.. references.Order(StringComparer.Ordinal)]);
+            isPackable,
+            [.. references.Order(StringComparer.Ordinal)],
+            [.. imports.Order(StringComparer.Ordinal)]);
     }
 
     private JsonDocument MsBuild(string fullPath, string? targetFramework, params string[] properties) =>
         JsonDocument.Parse(ProcessRunner.Run(Root, "dotnet",
         [
-            "msbuild", fullPath, "-p:Configuration=Release",
-            .. targetFramework is null ? Array.Empty<string>() : [$"-p:TargetFramework={targetFramework}"],
+            "msbuild", fullPath, "-p:Configuration=Release", .. TargetFramework(targetFramework),
             .. properties, "-getItem:ProjectReference"
         ]));
+
+    /// <summary>
+    ///     Every file the evaluation imported, read from <c>-preprocess</c>: it marks each import with a comment holding
+    ///     the file's full path on a line of its own. <c>-getProperty</c> turns <c>-preprocess</c> off, hence a call of its own;
+    ///     <c>MSBuildAllProjects</c> is no substitute, recent SDKs no longer list <c>Directory.Build.props</c> in it.
+    /// </summary>
+    private IEnumerable<string> Imports(string fullPath, string? targetFramework) =>
+        ProcessRunner.Run(Root, "dotnet", ["msbuild", fullPath, "-p:Configuration=Release", .. TargetFramework(targetFramework), "-preprocess"])
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(line => Path.IsPathFullyQualified(line) && File.Exists(line))
+            .Select(Path.GetFullPath);
+
+    private static string[] TargetFramework(string? targetFramework) =>
+        targetFramework is null ? [] : [$"-p:TargetFramework={targetFramework}"];
 
     private static HashSet<string> References(JsonDocument document) =>
         document.RootElement.TryGetProperty("Items", out var items) && items.TryGetProperty("ProjectReference", out var refs)
             ? refs.EnumerateArray().Select(r => Path.GetFullPath(r.GetProperty("FullPath").GetString()!)).ToHashSet(StringComparer.Ordinal)
             : new HashSet<string>(StringComparer.Ordinal);
 
-    private sealed record EvaluatedProject(string FullPath, string PackageId, bool IsPackable, List<string> References);
+    private sealed record EvaluatedProject(string FullPath, string PackageId, bool IsPackable, List<string> References, List<string> Imports);
 }
 
 /// <summary>Turns <c>tag_format</c> (<c>{package}/v{version}</c>) into tag names and back.</summary>
