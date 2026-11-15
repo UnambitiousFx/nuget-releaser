@@ -3,19 +3,24 @@ using System.Text.Json;
 
 namespace UnambitiousFx.NugetReleaser.Tests;
 
-public sealed class GitHubReleasesTests
+public sealed class GitHubReleasesTests : IDisposable
 {
+    private readonly string _directory = Directory.CreateTempSubdirectory("nuget-releaser-assets-").FullName;
+
+    public void Dispose() => Directory.Delete(_directory, true);
+
     [Fact]
-    public async Task CreateAsync_ReleaseExists_ReturnsFalseWithoutCreating()
+    public async Task CreateAsync_ReleaseExists_ReturnsItWithoutCreating()
     {
         // Given
         var handler = new StubHandler { GetStatus = HttpStatusCode.OK };
 
         // When
-        var created = await handler.Client().CreateAsync("Lib/v1.0.0", "abc", "Lib 1.0.0", "- fix");
+        var (created, release) = await handler.Client().CreateAsync("Lib/v1.0.0", "abc", "Lib 1.0.0", "- fix");
 
         // Then
         Assert.False(created);
+        Assert.Equal(StubHandler.ReleaseId, release.Id);
         Assert.Empty(handler.Posts);
     }
 
@@ -26,10 +31,11 @@ public sealed class GitHubReleasesTests
         var handler = new StubHandler();
 
         // When
-        var created = await handler.Client().CreateAsync("Lib/v1.0.0", "abc123", "Lib 1.0.0", "- fix: a bug");
+        var (created, release) = await handler.Client().CreateAsync("Lib/v1.0.0", "abc123", "Lib 1.0.0", "- fix: a bug");
 
         // Then
         Assert.True(created);
+        Assert.Equal(StubHandler.UploadUrl, release.UploadUrl);
         var (path, body) = Assert.Single(handler.Posts);
         Assert.Equal("/repos/o/r/releases", path);
         Assert.Equal("Lib/v1.0.0", body.GetProperty("tag_name").GetString());
@@ -99,26 +105,154 @@ public sealed class GitHubReleasesTests
         Assert.DoesNotContain(token, error.ToString());
     }
 
+    [Fact]
+    public async Task UploadAssetsAsync_NewFiles_UploadsEachUnderItsName()
+    {
+        // Given
+        var handler = new StubHandler();
+        var zip = Asset("tool-linux-x64.tar.gz", "binary");
+        var sums = Asset("checksums.txt", "abc  tool-linux-x64.tar.gz");
+
+        // When
+        var uploaded = await handler.Client().UploadAssetsAsync(Release(), [zip, sums]);
+
+        // Then: posted to upload_url without its URI template, as raw bytes
+        Assert.Equal(["tool-linux-x64.tar.gz", "checksums.txt"], uploaded);
+        Assert.Equal(["tool-linux-x64.tar.gz", "checksums.txt"], handler.Uploads.Select(u => u.Name));
+        Assert.All(handler.Uploads, u => Assert.StartsWith("https://uploads.github.test/repos/o/r/releases/42/assets?name=", u.Url));
+        Assert.All(handler.Uploads, u => Assert.Equal("application/octet-stream", u.ContentType));
+        Assert.Equal("binary", handler.Uploads[0].Content);
+    }
+
+    [Fact]
+    public async Task UploadAssetsAsync_AssetAlreadyThere_IsSkipped()
+    {
+        // Given: a previous run uploaded the archive, then failed
+        var handler = new StubHandler { ExistingAssets = ["tool-linux-x64.tar.gz"] };
+
+        // When
+        var uploaded = await handler.Client().UploadAssetsAsync(Release(), [Asset("tool-linux-x64.tar.gz", "x"), Asset("checksums.txt", "y")]);
+
+        // Then
+        Assert.Equal(["checksums.txt"], uploaded);
+        Assert.Equal(["checksums.txt"], handler.Uploads.Select(u => u.Name));
+    }
+
+    [Theory]
+    [InlineData(150)]
+    [InlineData(200)]
+    public async Task UploadAssetsAsync_AssetOnALaterPage_IsSkipped(int count)
+    {
+        // Given: a release with more assets than one page holds, the archive among the last ones
+        var existing = Enumerable.Range(0, count - 1).Select(i => $"other-{i:D3}.zip").Append("tool-linux-x64.tar.gz").ToList();
+        var handler = new StubHandler { ExistingAssets = existing };
+
+        // When
+        var uploaded = await handler.Client().UploadAssetsAsync(Release(), [Asset("tool-linux-x64.tar.gz", "x"), Asset("checksums.txt", "y")]);
+
+        // Then: every page was read, and an exact multiple of the page size ends on an empty page
+        Assert.Equal(["checksums.txt"], uploaded);
+        Assert.Equal(count / 100 + 1, handler.Gets.Count(g => g.Contains("/assets", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task UploadAssetsAsync_NameWithSpace_IsEscaped()
+    {
+        // Given
+        var handler = new StubHandler();
+
+        // When
+        await handler.Client().UploadAssetsAsync(Release(), [Asset("release notes.txt", "x")]);
+
+        // Then
+        Assert.EndsWith("?name=release%20notes.txt", Assert.Single(handler.Uploads).Url);
+    }
+
+    [Fact]
+    public async Task UploadAssetsAsync_UploadRejected_ThrowsWithStatusCode()
+    {
+        // Given
+        var handler = new StubHandler { UploadStatus = HttpStatusCode.UnprocessableEntity };
+
+        // When
+        var error = await Assert.ThrowsAsync<ReleaserException>(() => handler.Client().UploadAssetsAsync(Release(), [Asset("a.zip", "x")]));
+
+        // Then
+        Assert.Contains("a.zip", error.Message);
+        Assert.Contains("(422)", error.Message);
+    }
+
+    [Fact]
+    public async Task UploadAssetsAsync_NoFiles_CallsNothing()
+    {
+        // Given
+        var handler = new StubHandler();
+
+        // When
+        var uploaded = await handler.Client().UploadAssetsAsync(Release(), []);
+
+        // Then
+        Assert.Empty(uploaded);
+        Assert.Empty(handler.Gets);
+    }
+
+    private static GitHubRelease Release() => new(StubHandler.ReleaseId, "v1.0.0", StubHandler.UploadUrl);
+
+    private string Asset(string name, string content)
+    {
+        var path = Path.Combine(_directory, name);
+        File.WriteAllText(path, content);
+        return path;
+    }
+
     private sealed class StubHandler : HttpMessageHandler
     {
+        public const long ReleaseId = 42;
+        public const string UploadUrl = "https://uploads.github.test/repos/o/r/releases/42/assets{?name,label}";
+
         public HttpStatusCode GetStatus { get; init; } = HttpStatusCode.NotFound;
         public HttpStatusCode PostStatus { get; init; } = HttpStatusCode.Created;
-        public string PostResponse { get; init; } = "{}";
+        public HttpStatusCode UploadStatus { get; init; } = HttpStatusCode.Created;
+        public string PostResponse { get; init; } = ReleaseJson;
+        public List<string> ExistingAssets { get; init; } = [];
         public List<string> Gets { get; } = [];
         public List<(string Path, JsonElement Body)> Posts { get; } = [];
+        public List<(string Name, string Url, string? ContentType, string Content)> Uploads { get; } = [];
+
+        private static string ReleaseJson => $$"""{"id":{{ReleaseId}},"tag_name":"v1.0.0","upload_url":"{{UploadUrl}}"}""";
 
         public GitHubReleases Client() => new(new HttpClient(this) { BaseAddress = new Uri("https://api.github.test/") }, "o/r");
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            var uri = request.RequestUri!;
+            if (uri.Host.StartsWith("uploads.", StringComparison.Ordinal))
+            {
+                var name = Uri.UnescapeDataString(uri.Query["?name=".Length..]);
+                Uploads.Add((name, uri.AbsoluteUri, request.Content!.Headers.ContentType?.MediaType, await request.Content.ReadAsStringAsync(cancellationToken)));
+                return new HttpResponseMessage(UploadStatus) { Content = new StringContent("{}") };
+            }
+
             if (request.Method == HttpMethod.Get)
             {
-                Gets.Add(request.RequestUri!.AbsoluteUri);
-                return new HttpResponseMessage(GetStatus);
+                Gets.Add(uri.AbsoluteUri);
+                if (uri.AbsolutePath.EndsWith("/assets", StringComparison.Ordinal))
+                {
+                    // Paged as GitHub does it: ?per_page=N&page=P, P from 1.
+                    var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
+                    var perPage = int.Parse(query["per_page"] ?? "30", System.Globalization.CultureInfo.InvariantCulture);
+                    var page = int.Parse(query["page"] ?? "1", System.Globalization.CultureInfo.InvariantCulture);
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(JsonSerializer.Serialize(ExistingAssets.Skip((page - 1) * perPage).Take(perPage).Select(n => new { name = n })))
+                    };
+                }
+
+                return new HttpResponseMessage(GetStatus) { Content = new StringContent(GetStatus == HttpStatusCode.OK ? ReleaseJson : "{}") };
             }
 
             var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken)).RootElement.Clone();
-            Posts.Add((request.RequestUri!.AbsolutePath, body));
+            Posts.Add((uri.AbsolutePath, body));
             return new HttpResponseMessage(PostStatus) { Content = new StringContent(PostResponse) };
         }
     }

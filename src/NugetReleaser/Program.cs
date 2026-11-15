@@ -5,13 +5,15 @@ using UnambitiousFx.NugetReleaser;
 const string usage = """
                      Usage:
                        nuget-releaser plan [--json] [--config <path>]
-                       nuget-releaser release [--dry-run] [--config <path>] [--output <dir>]
+                       nuget-releaser release [--dry-run] [--config <path>] [--output <dir>] [--asset <path>]...
 
                      plan      Prints what would be released, with old and new versions and why. Changes nothing.
                      release   Packs the released packages; then, unless --dry-run, pushes them, tags and creates GitHub Releases.
 
                      --config  Configuration file (default: nuget-releaser.toml at the repository root).
                      --output  Where packages are written (default: artifacts/nuget-releaser at the repository root).
+                     --asset   A file to attach to every GitHub Release the run creates; the file name may use * and ?
+                               (dist/*.zip). Repeatable. An existing release gets the assets it is missing.
                      """;
 
 if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
@@ -22,6 +24,7 @@ if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
 
 var command = args[0];
 var options = new Dictionary<string, string?>();
+var assets = new List<string>();
 for (var i = 1; i < args.Length; i++)
 {
     switch (args[i])
@@ -31,6 +34,9 @@ for (var i = 1; i < args.Length; i++)
             break;
         case "--config" or "--output" when i + 1 < args.Length:
             options[args[i]] = args[++i];
+            break;
+        case "--asset" when i + 1 < args.Length && command == "release":
+            assets.Add(args[++i]);
             break;
         default:
             Console.Error.WriteLine($"Unknown or incomplete option '{args[i]}'.\n\n{usage}");
@@ -65,7 +71,7 @@ try
     if (command == "release")
     {
         var output = options.GetValueOrDefault("--output") ?? Path.Combine(repository.Root, "artifacts", "nuget-releaser");
-        await releaser.ReleaseAsync(plan, output, options.ContainsKey("--dry-run"));
+        await releaser.ReleaseAsync(plan, output, options.ContainsKey("--dry-run"), assets);
     }
 
     return 0;

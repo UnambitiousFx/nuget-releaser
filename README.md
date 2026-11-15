@@ -63,6 +63,9 @@ nuget-releaser release --dry-run
 
 # pack, push to the feeds, push the tags and create the GitHub Release
 NUGET_API_KEY=... GITHUB_TOKEN=... nuget-releaser release
+
+# same, and attach files to the GitHub Release (repeatable; * and ? in the file name)
+GITHUB_TOKEN=... nuget-releaser release --asset "dist/*.zip" --asset dist/checksums.txt
 ```
 
 ```text
@@ -83,7 +86,7 @@ the defaults below apply.
 
 ```toml
 [defaults]
-tag_format = "{package}/v{version}"
+tag_format = "{package}/v{version}" # "v{version}" is allowed in a repository with a single package
 initial_version = "0.1.0"          # version of a package that has no tag yet
 shared_paths = ["Directory.Build.props", "Directory.Packages.props", "global.json"]  # plus what MSBuild imports; list files it does not, such as NuGet.config
 
@@ -99,6 +102,10 @@ name = "nuget.org"
 source = "https://api.nuget.org/v3/index.json"
 api_key_env = "NUGET_API_KEY"      # environment variable holding the key
 ```
+
+To tag and release on GitHub without pushing to any feed, set `feed = []` (a top-level key, before any table).
+nuget-releaser releases itself this way: see [`nuget-releaser.toml`](nuget-releaser.toml) and
+[`release.yml`](.github/workflows/release.yml).
 
 | Environment variable | Used for |
 |---|---|

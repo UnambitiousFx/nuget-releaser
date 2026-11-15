@@ -17,9 +17,16 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
     /// <summary>Builds the plan from the repository's packages, tags and history.</summary>
     public ReleasePlan Plan()
     {
+        var packages = repository.DiscoverPackages(config);
+        if (!config.Defaults.TagFormat.Contains("{package}") && packages.Count > 1)
+        {
+            throw new ReleaserException($"tag_format \"{config.Defaults.TagFormat}\" has no {{package}}, so it can tag only one package; "
+                                        + $"found {packages.Count}: {string.Join(", ", packages.Select(p => p.Id).Order(StringComparer.Ordinal))}.");
+        }
+
         var tagsAtHead = repository.TagsAtHead().ToHashSet(StringComparer.Ordinal);
         var tags = repository.Tags().Where(t => !tagsAtHead.Contains(t)).ToList();
-        var states = repository.DiscoverPackages(config).Select(package =>
+        var states = packages.Select(package =>
         {
             var latest = TagFormat.Latest(config.Defaults.TagFormat, package.Id, tags);
             var tagged = TagFormat.Latest(config.Defaults.TagFormat, package.Id, tagsAtHead);
@@ -29,14 +36,24 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
         return Planner.Plan(states, SemVersion.Parse(config.Defaults.InitialVersion));
     }
 
-    /// <summary>Packs every released package into <paramref name="outputDirectory" />; unless <paramref name="dryRun" />, publishes them.</summary>
-    public async Task ReleaseAsync(ReleasePlan plan, string outputDirectory, bool dryRun)
+    /// <summary>
+    ///     Packs every released package into <paramref name="outputDirectory" />; unless <paramref name="dryRun" />, publishes
+    ///     them, and attaches the files matching <paramref name="assets" /> to every GitHub Release the run creates.
+    /// </summary>
+    public async Task ReleaseAsync(ReleasePlan plan, string outputDirectory, bool dryRun, IReadOnlyList<string>? assets = null)
     {
         var releases = plan.Releases.ToList();
         if (releases.Count == 0)
         {
             log.WriteLine("Nothing to release.");
             return;
+        }
+
+        // Before anything is published: a missing asset is a mistake to fix, not a release to finish later.
+        var assetFiles = ResolveAssets(assets ?? []);
+        if (!dryRun && assetFiles.Count > 0 && gitHub is null)
+        {
+            throw new ReleaserException("--asset needs GitHub Releases: set GITHUB_TOKEN, and GITHUB_REPOSITORY unless origin is on github.com.");
         }
 
         // dotnet pack runs from the repository root: a relative path must not resolve twice, differently.
@@ -56,8 +73,11 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
         foreach (var release in releases)
         {
             log.WriteLine($"Packing {release.Id} {release.NextVersion}");
+            // GeneratePackageOnBuild (often turned on in CI) makes pack skip its own build to avoid a build/pack cycle,
+            // so a clean checkout would have no DLL to pack: the tool packs explicitly and turns it off.
             ProcessRunner.Run(repository.Root, "dotnet", "pack", Path.Combine(repository.Root, release.Project),
-                "--configuration", "Release", "--output", outputDirectory, $"-p:CustomBeforeMicrosoftCommonProps={versionsProps}");
+                "--configuration", "Release", "--output", outputDirectory, $"-p:CustomBeforeMicrosoftCommonProps={versionsProps}",
+                "-p:GeneratePackageOnBuild=false");
             var nupkg = Path.Combine(outputDirectory, $"{release.Id}.{release.NextVersion}.nupkg");
             if (!File.Exists(nupkg))
             {
@@ -71,6 +91,11 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
         {
             log.WriteLine($"Dry run: {packages.Count} package(s) packed into {outputDirectory}; nothing pushed, tagged or released.");
             return;
+        }
+
+        if (config.Feed.Count == 0)
+        {
+            log.WriteLine("No feed configured: nothing pushed.");
         }
 
         foreach (var feed in config.Feed)
@@ -93,10 +118,42 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
             repository.CreateTag(tag, head);
         }
 
-        await CreateGitHubReleasesAsync(releases, tags, head);
+        await CreateGitHubReleasesAsync(releases, tags, head, assetFiles);
     }
 
-    private async Task CreateGitHubReleasesAsync(List<PlannedPackage> releases, List<string> tags, string head)
+    /// <summary>
+    ///     Each pattern is a file, or a directory followed by a file-name pattern with <c>*</c> or <c>?</c>
+    ///     (<c>dist/*.zip</c>), relative to the current directory. Every pattern must match at least one file.
+    /// </summary>
+    private static List<string> ResolveAssets(IReadOnlyList<string> patterns)
+    {
+        var files = new List<string>();
+        foreach (var pattern in patterns)
+        {
+            var fullPattern = Path.GetFullPath(pattern);
+            var fileName = Path.GetFileName(fullPattern);
+            var directory = Path.GetDirectoryName(fullPattern)!;
+            var matches = fileName.AsSpan().IndexOfAny('*', '?') >= 0
+                ? Directory.Exists(directory) ? Directory.GetFiles(directory, fileName).Order(StringComparer.Ordinal).ToList() : []
+                : File.Exists(fullPattern) ? [fullPattern] : [];
+            if (matches.Count == 0)
+            {
+                throw new ReleaserException($"--asset {pattern} matches no file.");
+            }
+
+            files.AddRange(matches);
+        }
+
+        if (files.GroupBy(Path.GetFileName, StringComparer.Ordinal).FirstOrDefault(g => g.Count() > 1) is { } duplicate)
+        {
+            // An asset is named after its file: two files of the same name would be one asset.
+            throw new ReleaserException($"--asset matches {duplicate.Key} more than once: {string.Join(", ", duplicate)}.");
+        }
+
+        return [.. files.Distinct(StringComparer.Ordinal)];
+    }
+
+    private async Task CreateGitHubReleasesAsync(List<PlannedPackage> releases, List<string> tags, string head, List<string> assets)
     {
         if (gitHub is null)
         {
@@ -108,7 +165,7 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
         {
             for (var i = 0; i < releases.Count; i++)
             {
-                await CreateAsync(gitHub, tags[i], head, $"{releases[i].Id} {releases[i].NextVersion}", Notes(releases[i]));
+                await CreateAsync(gitHub, tags[i], head, $"{releases[i].Id} {releases[i].NextVersion}", Notes(releases[i]), assets);
             }
 
             return;
@@ -116,13 +173,18 @@ internal sealed class Releaser(Repository repository, ReleaserConfig config, Tex
 
         var name = string.Join(", ", releases.Select(r => $"{r.Id} {r.NextVersion}"));
         var body = string.Join("\n\n", releases.Select(r => $"## {r.Id} {r.NextVersion}\n\n{Notes(r)}"));
-        await CreateAsync(gitHub, $"releases/{head[..7]}", head, name, body);
+        await CreateAsync(gitHub, $"releases/{head[..7]}", head, name, body, assets);
     }
 
-    private async Task CreateAsync(GitHubReleases github, string tag, string target, string name, string body)
+    /// <summary>Assets are uploaded to an existing release too: a re-run after a failed upload sends what is missing.</summary>
+    private async Task CreateAsync(GitHubReleases github, string tag, string target, string name, string body, List<string> assets)
     {
-        var created = await github.CreateAsync(tag, target, name, body);
+        var (created, release) = await github.CreateAsync(tag, target, name, body);
         log.WriteLine(created ? $"Created GitHub Release {tag}" : $"GitHub Release {tag} already exists");
+        foreach (var asset in await github.UploadAssetsAsync(release, assets))
+        {
+            log.WriteLine($"Attached {asset} to {tag}");
+        }
     }
 
     private static string Notes(PlannedPackage release) =>

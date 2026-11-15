@@ -1,0 +1,12 @@
+# nuget-releaser releases itself (.github/workflows/release.yml).
+
+# Not on NuGet yet: a release ships the Native AOT binaries only. Top-level keys come before any table.
+feed = []
+
+[defaults]
+# The repository has a single package, and its releases have always been tagged vX.Y.Z.
+tag_format = "v{version}"
+
+[github]
+# One release per tag, named "UnambitiousFx.NugetReleaser X.Y.Z", with the binaries attached by --asset.
+release_mode = "per-package"

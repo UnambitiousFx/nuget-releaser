@@ -47,8 +47,8 @@ internal sealed class ReleaserConfig
             }
         }
 
-        Require(Defaults.TagFormat.Contains("{package}") && Defaults.TagFormat.Contains("{version}"),
-            "tag_format must contain both {package} and {version}.");
+        // Without {package}, only a repository with a single package can be tagged: checked once packages are discovered.
+        Require(Defaults.TagFormat.Contains("{version}"), "tag_format must contain {version}.");
         Require(SemVersion.TryParse(Defaults.InitialVersion, out _), "initial_version must be a major.minor.patch version.");
         Require(Defaults.BumpSource == "conventional-commits", "bump_source supports only \"conventional-commits\" for now.");
         Require(Defaults.VersionSource == "tag", "version_source supports only \"tag\" for now.");

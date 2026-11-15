@@ -57,8 +57,34 @@ public sealed class ReleaserConfigTests : IDisposable
         Assert.Equal("GITHUB_TOKEN", feed.ApiKeyEnv);
     }
 
+    [Fact]
+    public void Load_TagFormatWithoutPackage_IsAccepted()
+    {
+        // Given: a repository with a single package can keep plain version tags
+        File.WriteAllText(_path, "[defaults]\ntag_format = \"v{version}\"");
+
+        // When
+        var config = ReleaserConfig.Load(_path);
+
+        // Then
+        Assert.Equal("v{version}", config.Defaults.TagFormat);
+    }
+
+    [Fact]
+    public void Load_EmptyFeedList_PublishesToNoFeed()
+    {
+        // Given: a top-level key, so before any table
+        File.WriteAllText(_path, "feed = []\n\n[github]\nrelease_mode = \"per-package\"");
+
+        // When
+        var config = ReleaserConfig.Load(_path);
+
+        // Then
+        Assert.Empty(config.Feed);
+    }
+
     [Theory]
-    [InlineData("[defaults]\ntag_format = \"v{version}\"", "tag_format")]
+    [InlineData("[defaults]\ntag_format = \"{package}/latest\"", "tag_format")]
     [InlineData("[defaults]\nbump_source = \"changesets\"", "bump_source")]
     [InlineData("[defaults]\nversion_source = \"feed\"", "version_source")]
     [InlineData("[github]\nrelease_mode = \"sometimes\"", "release_mode")]

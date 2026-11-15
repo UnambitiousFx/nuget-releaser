@@ -24,7 +24,8 @@ independently. Namespace: `UnambitiousFx.NugetReleaser`. Solution: `NugetRelease
   `JsonSerializerContext`s; never reflection-based overloads.
 - **Secrets**: never print or log a command line that may hold an API key.
 - **Distribution**: Native AOT binaries only (`linux`/`osx`/`win` × `x64`/`arm64`, `binaries.yml`), attached to the
-  GitHub release; the tool itself is not published to NuGet yet. Binaries are built only on release, not on PRs:
+  GitHub release by the tool itself (`release --asset`, `nuget-releaser.toml`); the tool is not published to NuGet yet
+  (`feed = []`). Binaries are built only on release, not on PRs:
   anything that breaks AOT is caught only then, so check with `dotnet publish src/NugetReleaser -r <rid> -p:PublishAot=true`.
 - **Modern C#**: file-scoped namespaces, pattern matching, records, collection expressions.
 
@@ -55,7 +56,7 @@ dotnet test --solution NugetReleaser.slnx
 
 ## Commits & Branches
 
-semantic-release derives the next version from commit messages (see `CONTRIBUTING.md`), so these rules decide what gets released.
+nuget-releaser releases itself and derives the next version from commit messages (see `CONTRIBUTING.md`), so these rules decide what gets released. Only commits touching the tool's paths count (`src/NugetReleaser`, the build files it imports, `shared_paths`).
 
 - Commits and PR titles follow [Conventional Commits](https://www.conventionalcommits.org/): `type(scope)?: summary`, imperative, lowercase, no trailing period.
 - `feat` → minor, `fix`/`perf` → patch. `docs`, `test`, `refactor`, `build`, `ci`, `chore`, `style`, `revert` → no release.

@@ -6,7 +6,10 @@ using System.Text.RegularExpressions;
 
 namespace UnambitiousFx.NugetReleaser;
 
-/// <summary>Creates GitHub Releases through the REST API; an existing release for a tag is left alone.</summary>
+/// <summary>
+///     Creates GitHub Releases through the REST API and attaches assets to them; an existing release, or an asset of the
+///     same name, is left alone.
+/// </summary>
 internal sealed partial class GitHubReleases(HttpClient http, string repository)
 {
     [GeneratedRegex(@"github\.com[:/](?<slug>[^/]+/[^/]+?)(\.git)?/?$")]
@@ -34,13 +37,13 @@ internal sealed partial class GitHubReleases(HttpClient http, string repository)
         return new GitHubReleases(http, repository);
     }
 
-    /// <summary>Returns <c>false</c> when a release for <paramref name="tag" /> already exists.</summary>
-    public async Task<bool> CreateAsync(string tag, string target, string name, string body)
+    /// <summary>Creates the release for <paramref name="tag" />; <c>Created</c> is <c>false</c> when it already existed.</summary>
+    public async Task<(bool Created, GitHubRelease Release)> CreateAsync(string tag, string target, string name, string body)
     {
         using var existing = await http.GetAsync($"repos/{repository}/releases/tags/{Uri.EscapeDataString(tag)}");
         if (existing.IsSuccessStatusCode)
         {
-            return false;
+            return (false, await ReadReleaseAsync(existing, tag));
         }
 
         if (existing.StatusCode != HttpStatusCode.NotFound)
@@ -55,12 +58,84 @@ internal sealed partial class GitHubReleases(HttpClient http, string repository)
             throw new ReleaserException($"GitHub: creating release {tag} failed ({(int)created.StatusCode}): {await created.Content.ReadAsStringAsync()}");
         }
 
-        return true;
+        return (true, await ReadReleaseAsync(created, tag));
     }
+
+    /// <summary>
+    ///     Uploads each of <paramref name="files" /> under its file name, skipping the names the release already has, so a
+    ///     re-run after a failed upload only sends what is missing. Returns the names uploaded.
+    /// </summary>
+    public async Task<IReadOnlyList<string>> UploadAssetsAsync(GitHubRelease release, IReadOnlyList<string> files)
+    {
+        if (files.Count == 0)
+        {
+            return [];
+        }
+
+        var existing = await ExistingAssetsAsync(release);
+
+        // upload_url is a URI template: "https://uploads.github.com/repos/o/r/releases/1/assets{?name,label}".
+        var uploadUrl = release.UploadUrl.Split('{')[0];
+        var uploaded = new List<string>();
+        foreach (var file in files)
+        {
+            var name = Path.GetFileName(file);
+            if (existing.Contains(name))
+            {
+                continue;
+            }
+
+            await using var stream = File.OpenRead(file);
+            using var content = new StreamContent(stream);
+            content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+            using var response = await http.PostAsync($"{uploadUrl}?name={Uri.EscapeDataString(name)}", content);
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new ReleaserException($"GitHub: uploading {name} to release {release.TagName} failed ({(int)response.StatusCode}): {await response.Content.ReadAsStringAsync()}");
+            }
+
+            uploaded.Add(name);
+        }
+
+        return uploaded;
+    }
+
+    /// <summary>Every asset name of the release, page by page: a name missed on a later page would be uploaded again and rejected.</summary>
+    private async Task<HashSet<string>> ExistingAssetsAsync(GitHubRelease release)
+    {
+        const int pageSize = 100;
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        for (var page = 1; ; page++)
+        {
+            using var listed = await http.GetAsync($"repos/{repository}/releases/{release.Id}/assets?per_page={pageSize}&page={page}");
+            if (!listed.IsSuccessStatusCode)
+            {
+                throw new ReleaserException($"GitHub: listing the assets of release {release.TagName} failed ({(int)listed.StatusCode}).");
+            }
+
+            var assets = await listed.Content.ReadFromJsonAsync(GitHubJsonContext.Default.ListGitHubAsset) ?? [];
+            names.UnionWith(assets.Select(a => a.Name));
+            if (assets.Count < pageSize)
+            {
+                return names;
+            }
+        }
+    }
+
+    private static async Task<GitHubRelease> ReadReleaseAsync(HttpResponseMessage response, string tag) =>
+        await response.Content.ReadFromJsonAsync(GitHubJsonContext.Default.GitHubRelease)
+        ?? throw new ReleaserException($"GitHub: release {tag} came back empty.");
 }
 
 internal sealed record CreateReleaseRequest(string TagName, string TargetCommitish, string Name, string Body);
 
+/// <summary>The fields of a GitHub Release this tool uses.</summary>
+internal sealed record GitHubRelease(long Id, string TagName, string UploadUrl);
+
+internal sealed record GitHubAsset(string Name);
+
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
 [JsonSerializable(typeof(CreateReleaseRequest))]
+[JsonSerializable(typeof(GitHubRelease))]
+[JsonSerializable(typeof(List<GitHubAsset>))]
 internal sealed partial class GitHubJsonContext : JsonSerializerContext;
