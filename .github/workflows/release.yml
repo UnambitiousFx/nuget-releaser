@@ -119,3 +119,28 @@ jobs:
         run: '"$RUNNER_TEMP/bin/nuget-releaser" release --asset "$RUNNER_TEMP/dist/*"'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # unambitiousfx.com builds these docs from main and the release tags, so it is redeployed after every run,
+  # released or not, to pick up `docs:` fixes too. `release` is skipped both when nothing is released and when
+  # `binaries` failed, so a skipped `release` only counts when the plan had nothing to release.
+  # GITHUB_TOKEN cannot start workflows in another repo, hence the org app; skipped until DOCS_APP_CLIENT_ID is set.
+  docs-site:
+    name: Redeploy docs site
+    needs: [plan, release]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.release.result == 'success' || (needs.release.result == 'skipped' && needs.plan.outputs.release != 'true')) && vars.DOCS_APP_CLIENT_ID != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get docs site token
+        id: site
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.DOCS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DOCS_APP_KEY }}
+          owner: UnambitiousFx
+          repositories: UnambitiousFx.github.io
+          permission-actions: write
+
+      - name: Redeploy docs site
+        run: gh workflow run deploy.yml -R UnambitiousFx/UnambitiousFx.github.io
+        env:
+          GH_TOKEN: ${{ steps.site.outputs.token }}
